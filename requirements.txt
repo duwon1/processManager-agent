@@ -1,0 +1,5 @@
+fastapi
+uvicorn
+psutil
+httpx
+websockets

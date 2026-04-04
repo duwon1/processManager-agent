@@ -1,0 +1,6 @@
+.env
+__pycache__/
+api/__pycache__/
+.idea/
+.venv/
+*.iml
