@@ -34,11 +34,14 @@ class Settings:
 
 def get_settings() -> Settings:
     """환경변수와 기본값을 합쳐 Settings 인스턴스를 반환합니다.
-    ACCOUNT_TOKEN이 없으면 즉시 RuntimeError를 발생시킵니다.
+    ACCOUNT_TOKEN, SPRING_WS_URL이 없으면 즉시 RuntimeError를 발생시킵니다.
     """
     load_env_file()
 
-    websocket_url = os.getenv("SPRING_WS_URL", "wss://catkinate-unsynonymously-landen.ngrok-free.dev/ws-native")
+    # SPRING_WS_URL은 .env에서 반드시 주입해야 합니다.
+    websocket_url = os.getenv("SPRING_WS_URL", "").strip()
+    if not websocket_url:
+        raise RuntimeError("SPRING_WS_URL이 없습니다. .env 파일에 설정해주세요.")
 
     # ACCOUNT_TOKEN은 설치 시 반드시 주입해야 합니다.
     account_token = os.getenv("ACCOUNT_TOKEN", "").strip()
@@ -58,3 +61,4 @@ def get_settings() -> Settings:
         port=port,
         reload=reload_enabled,
     )
+
