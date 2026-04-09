@@ -183,6 +183,22 @@ async def run_agent(url: str, account_token: str, hostname: str, os_type: str) -
                             ))
                             continue
 
+                        # ── 언인스톨 명령 처리 ──
+                        if cmd_type == "uninstall":
+                            if payload.get("nodeName") == hostname:
+                                print("[에이전트] 언인스톨 명령 수신 → 자가 삭제 시작")
+                                import subprocess
+                                subprocess.Popen([
+                                    'bash', '-c',
+                                    'sleep 2 && sudo systemctl disable processmanager-agent && '
+                                    'sudo rm -rf /opt/processmanager-agent && '
+                                    'sudo rm -f /etc/systemd/system/processmanager-agent.service && '
+                                    'sudo systemctl daemon-reload && '
+                                    'sudo systemctl stop processmanager-agent'
+                                ])
+                                raise SystemExit(0)
+                            continue
+
                         # ── 터미널 명령 처리 ──
                         if cmd_type.startswith("terminal-"):
                             _handle_terminal_command(payload, cmd_type, hostname)
