@@ -119,6 +119,39 @@ async def run_agent(url: str, account_token: str, hostname: str, os_type: str) -
                                 ))
                         await asyncio.sleep(0.05)
 
+                async def check_update_loop():
+                    """60초마다 GitHub 최신 커밋을 확인하고 업데이트 가능 시 알립니다."""
+                    import subprocess, os
+                    agent_dir = os.path.dirname(os.path.abspath(__file__))
+                    try:
+                        current_sha = subprocess.check_output(
+                            ['git', '-C', agent_dir, 'rev-parse', 'HEAD'],
+                            text=True, timeout=5
+                        ).strip()[:7]
+                    except Exception:
+                        current_sha = 'unknown'
+                    while True:
+                        await asyncio.sleep(60)
+                        try:
+                            result = subprocess.check_output(
+                                ['git', '-C', agent_dir, 'ls-remote', 'origin', 'HEAD'],
+                                text=True, timeout=10
+                            )
+                            latest_sha = result.split()[0][:7] if result.strip() else current_sha
+                            if latest_sha != current_sha:
+                                await websocket.send(stomp_frame(
+                                    "SEND",
+                                    {"destination": "/app/agent.update-available", "content-type": "application/json"},
+                                    __import__('json').dumps({
+                                        "nodeName": hostname,
+                                        "currentSha": current_sha,
+                                        "latestSha": latest_sha,
+                                    }),
+                                ))
+                                print(f"[에이전트] 업데이트 가능: {current_sha} → {latest_sha}")
+                        except Exception as e:
+                            print(f"[에이전트] 업데이트 확인 오류: {e}")
+
                 async def receive_commands_loop():
                     """백엔드에서 오는 명령(kill·터미널·시스템 정보·서비스 제어)을 수신하고 처리합니다."""
                     while True:
@@ -183,19 +216,35 @@ async def run_agent(url: str, account_token: str, hostname: str, os_type: str) -
                             ))
                             continue
 
+                        # ── 업데이트 명령 처리 ──
+                        if cmd_type == "update":
+                            if payload.get("nodeName") == hostname:
+                                print("[에이전트] 업데이트 명령 수신 → 자가 업데이트 시작")
+                                import subprocess, os
+                                agent_dir = os.path.dirname(os.path.abspath(__file__))
+                                cmds = ' && '.join([
+                                    f'git -C {agent_dir} pull origin master',
+                                    f'{agent_dir}/.venv/bin/pip install -r {agent_dir}/requirements.txt -q',
+                                    'sudo systemctl restart processmanager-agent 2>/dev/null || true',
+                                ])
+                                subprocess.Popen(['bash', '-c', f'sleep 1 && {cmds}'])
+                                raise SystemExit(0)
+                            continue
+
                         # ── 언인스톨 명령 처리 ──
                         if cmd_type == "uninstall":
                             if payload.get("nodeName") == hostname:
                                 print("[에이전트] 언인스톨 명령 수신 → 자가 삭제 시작")
-                                import subprocess
-                                subprocess.Popen([
-                                    'bash', '-c',
-                                    'sleep 2 && sudo systemctl disable processmanager-agent && '
-                                    'sudo rm -rf /opt/processmanager-agent && '
-                                    'sudo rm -f /etc/systemd/system/processmanager-agent.service && '
-                                    'sudo systemctl daemon-reload && '
-                                    'sudo systemctl stop processmanager-agent'
+                                import subprocess, os
+                                agent_dir = os.path.dirname(os.path.abspath(__file__))
+                                cmds = ' && '.join([
+                                    'sudo systemctl disable processmanager-agent 2>/dev/null || true',
+                                    'sudo systemctl stop processmanager-agent 2>/dev/null || true',
+                                    'sudo rm -f /etc/systemd/system/processmanager-agent.service 2>/dev/null || true',
+                                    'sudo systemctl daemon-reload 2>/dev/null || true',
+                                    f'rm -rf {agent_dir}',
                                 ])
+                                subprocess.Popen(['bash', '-c', f'sleep 2 && {cmds}'])
                                 raise SystemExit(0)
                             continue
 
@@ -246,6 +295,7 @@ async def run_agent(url: str, account_token: str, hostname: str, os_type: str) -
                     send_service_loop(),
                     send_terminal_output_loop(),
                     receive_commands_loop(),
+                    check_update_loop(),
                 )
 
         except Exception as e:
