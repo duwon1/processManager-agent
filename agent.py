@@ -1,5 +1,5 @@
 """STOMP WebSocket 에이전트 루프입니다.
-모니터링·프로세스·터미널 데이터를 단일 연결로 처리하며, 끊기면 자동 재연결합니다.
+모니터링·프로세스·서비스·하드웨어 정보·터미널 데이터를 단일 연결로 처리하며, 끊기면 자동 재연결합니다.
 """
 import asyncio
 import json
@@ -7,11 +7,12 @@ import json
 import websockets
 from fastapi import HTTPException
 
-from stomp import stomp_frame, extract_stomp_body
+from stomp import stomp_frame, extract_stomp_body, extract_stomp_destination
 from terminal import terminal_manager
-from system import metrics, process
+from system import metrics, process, hardware, services
 
 COMMAND_SUBSCRIPTION_ID = "agent-command-channel"
+SYSINFO_SUBSCRIPTION_ID = "sysinfo-request-channel"
 
 
 async def run_agent(url: str, account_token: str, hostname: str, os_type: str) -> None:
@@ -39,7 +40,7 @@ async def run_agent(url: str, account_token: str, hostname: str, os_type: str) -
                     raise RuntimeError(f"STOMP CONNECT 실패: {resp}")
                 print("[에이전트] STOMP 연결 성공")
 
-                # 에이전트 커맨드 채널 구독 (kill + 터미널 명령)
+                # 에이전트 커맨드 채널 구독 (kill + 터미널 + 서비스 제어)
                 await websocket.send(stomp_frame(
                     "SUBSCRIBE",
                     {
@@ -48,6 +49,17 @@ async def run_agent(url: str, account_token: str, hostname: str, os_type: str) -
                         "ack": "auto",
                     },
                 ))
+
+                # 시스템 정보 수집 요청 채널 구독
+                await websocket.send(stomp_frame(
+                    "SUBSCRIBE",
+                    {
+                        "id": SYSINFO_SUBSCRIPTION_ID,
+                        "destination": "/topic/agent.sysinfo-request",
+                        "ack": "auto",
+                    },
+                ))
+                print("[에이전트] 시스템 정보 요청 채널 구독 시작")
 
                 async def send_monitoring_loop():
                     """시스템 메트릭을 2초 간격으로 전송합니다."""
@@ -71,11 +83,24 @@ async def run_agent(url: str, account_token: str, hostname: str, os_type: str) -
                         ))
                         await asyncio.sleep(2)
 
+                async def send_service_loop():
+                    """서비스 목록을 10초 간격으로 전송합니다."""
+                    while True:
+                        try:
+                            svc_list = services.get_service_list()
+                            await websocket.send(stomp_frame(
+                                "SEND",
+                                {"destination": "/app/service", "content-type": "application/json"},
+                                json.dumps(svc_list),
+                            ))
+                        except Exception as e:
+                            print(f"[에이전트] 서비스 목록 전송 오류: {e}")
+                        await asyncio.sleep(10)
+
                 async def send_terminal_output_loop():
                     """모든 활성 터미널 세션의 PTY 출력을 STOMP으로 전송합니다."""
                     while True:
                         for session_id, queue in terminal_manager.get_all_queues():
-                            # 큐에 쌓인 출력을 모두 꺼내서 한 번에 전송
                             chunks = []
                             while not queue.empty():
                                 try:
@@ -92,10 +117,10 @@ async def run_agent(url: str, account_token: str, hostname: str, os_type: str) -
                                         "data": "".join(chunks),
                                     }),
                                 ))
-                        await asyncio.sleep(0.05)  # 50ms 폴링 (체감 지연 최소화)
+                        await asyncio.sleep(0.05)
 
                 async def receive_commands_loop():
-                    """백엔드에서 오는 kill 명령과 터미널 명령을 수신하고 처리합니다."""
+                    """백엔드에서 오는 명령(kill·터미널·시스템 정보·서비스 제어)을 수신하고 처리합니다."""
                     while True:
                         frame = await websocket.recv()
                         frame_text = str(frame)
@@ -112,14 +137,58 @@ async def run_agent(url: str, account_token: str, hostname: str, os_type: str) -
                             print(f"[에이전트] JSON 파싱 실패: {body}")
                             continue
 
+                        destination = extract_stomp_destination(frame_text)
+
+                        # ── 시스템 정보 수집 요청 ──
+                        if destination == "/topic/agent.sysinfo-request":
+                            if payload.get("nodeName") == hostname:
+                                try:
+                                    loop = asyncio.get_event_loop()
+                                    info = await loop.run_in_executor(None, hardware.collect)
+                                    info["nodeId"] = payload.get("nodeId")
+                                    await websocket.send(stomp_frame(
+                                        "SEND",
+                                        {"destination": "/app/system-info", "content-type": "application/json"},
+                                        json.dumps(info),
+                                    ))
+                                    print("[에이전트] 시스템 정보 전송 완료")
+                                except Exception as e:
+                                    print(f"[에이전트] 시스템 정보 수집 오류: {e}")
+                            continue
+
                         cmd_type = payload.get("type", "")
+
+                        # ── 서비스 제어 명령 ──
+                        if cmd_type == "service-control":
+                            if payload.get("nodeName") != hostname:
+                                continue
+                            svc_name = payload.get("name", "")
+                            action = payload.get("action", "")
+                            try:
+                                message = services.control_service(svc_name, action)
+                                success = True
+                            except Exception as e:
+                                message = str(e)
+                                success = False
+                            await websocket.send(stomp_frame(
+                                "SEND",
+                                {"destination": "/app/service-control-result", "content-type": "application/json"},
+                                json.dumps({
+                                    "name": svc_name,
+                                    "action": action,
+                                    "success": success,
+                                    "message": message,
+                                    "nodeName": hostname,
+                                }),
+                            ))
+                            continue
 
                         # ── 터미널 명령 처리 ──
                         if cmd_type.startswith("terminal-"):
                             _handle_terminal_command(payload, cmd_type, hostname)
                             continue
 
-                        # ── kill 명령 처리 (이 노드가 대상이 아니면 무시) ──
+                        # ── kill 명령 처리 ──
                         if payload.get("nodeName") != hostname:
                             continue
 
@@ -147,7 +216,6 @@ async def run_agent(url: str, account_token: str, hostname: str, os_type: str) -
                             }),
                         ))
 
-                        # 종료 후 프로세스 목록 즉시 갱신
                         fresh = process.get_process_data()
                         await websocket.send(stomp_frame(
                             "SEND",
@@ -155,10 +223,11 @@ async def run_agent(url: str, account_token: str, hostname: str, os_type: str) -
                             json.dumps(fresh),
                         ))
 
-                # 네 루프를 단일 연결에서 동시에 실행합니다.
+                # 다섯 루프를 단일 연결에서 동시에 실행합니다.
                 await asyncio.gather(
                     send_monitoring_loop(),
                     send_process_loop(),
+                    send_service_loop(),
                     send_terminal_output_loop(),
                     receive_commands_loop(),
                 )
@@ -171,7 +240,6 @@ async def run_agent(url: str, account_token: str, hostname: str, os_type: str) -
 
 def _handle_terminal_command(payload: dict, cmd_type: str, hostname: str) -> None:
     """터미널 관련 명령을 분기 처리합니다."""
-    # 다른 노드로 향하는 명령은 무시합니다.
     if payload.get("nodeName") and payload.get("nodeName") != hostname:
         return
 

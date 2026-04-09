@@ -85,8 +85,22 @@ def _get_net_io() -> tuple[int, int]:
     return sent, recv
 
 
+def _fmt_bytes(b: int) -> str:
+    """bytes → 사람이 읽기 쉬운 크기 문자열 (속도 단위 없음)."""
+    if b <= 0:
+        return "0 B"
+    if b >= 1024 ** 3:
+        return f"{b / 1024 ** 3:.1f} GB"
+    if b >= 1024 ** 2:
+        return f"{b / 1024 ** 2:.0f} MB"
+    return f"{b / 1024:.0f} KB"
+
+
 _last_net_sent, _last_net_recv = _get_net_io()
 _last_time = time.time()
+
+# 디스크 I/O 델타 추적 (네트워크와 동일한 방식)
+_last_disk_io = psutil.disk_io_counters()
 
 
 # ── 메모리 하드웨어 정보 ────────────────────────────────────────────────────
@@ -109,7 +123,6 @@ def _get_memory_hardware() -> str:
             text=True,
             timeout=5,
         )
-        # 실제 장착된 슬롯만 추출 (No Module Installed 제외)
         size_lines = re.findall(r'Size:\s+(\d+)\s+(MB|GB)', output)
         speeds = re.findall(r'Speed:\s+(\d+)\s+MT/s', output)
         mem_types = re.findall(r'\n\s+Type:\s+([^\n]+)', output)
@@ -143,7 +156,7 @@ def _get_memory_hardware() -> str:
 
 def collect_system_metrics() -> list:
     """현재 시스템 메트릭을 수집해 대시보드 표시 형식으로 반환합니다."""
-    global _last_time, _last_net_sent, _last_net_recv
+    global _last_time, _last_net_sent, _last_net_recv, _last_disk_io
 
     cpu_percent = psutil.cpu_percent(interval=None)
     mem_percent = psutil.virtual_memory().percent
@@ -162,6 +175,29 @@ def collect_system_metrics() -> list:
             return f"{bps / (1024 * 1024):.1f} MB/s"
         return f"{bps / 1024:.1f} KB/s"
 
+    # CPU 현재 속도
+    freq = psutil.cpu_freq()
+    cpu_freq_str = f"{freq.current:.0f} MHz" if freq else "N/A"
+
+    # 메모리 동적 값
+    mem = psutil.virtual_memory()
+    swap = psutil.swap_memory()
+    mem_in_use = _fmt_bytes(mem.used)
+    mem_available = _fmt_bytes(mem.available)
+    mem_cached = _fmt_bytes(getattr(mem, "cached", 0) or 0)
+    mem_committed = _fmt_bytes(mem.used + swap.used)
+
+    # 디스크 읽기/쓰기 속도 (델타 추적)
+    cur_disk = psutil.disk_io_counters()
+    if cur_disk and _last_disk_io:
+        disk_read_bps = max(0, (cur_disk.read_bytes - _last_disk_io.read_bytes) / time_diff)
+        disk_write_bps = max(0, (cur_disk.write_bytes - _last_disk_io.write_bytes) / time_diff)
+        disk_read_str = fmt_speed(disk_read_bps)
+        disk_write_str = fmt_speed(disk_write_bps)
+    else:
+        disk_read_str = disk_write_str = "N/A"
+    _last_disk_io = cur_disk
+
     return [
         {"id": 1,  "title": "CPU 사용률",    "value": f"{cpu_percent}%"},
         {"id": 2,  "title": "GPU 사용률",    "value": gpu_usage},
@@ -169,6 +205,13 @@ def collect_system_metrics() -> list:
         {"id": 4,  "title": "디스크 사용률", "value": f"{disk_percent}%"},
         {"id": 5,  "title": "업로드 속도",   "value": fmt_speed(sent_bps)},
         {"id": 6,  "title": "다운로드 속도", "value": fmt_speed(recv_bps)},
+        {"id": 7,  "title": "CPU 속도",      "value": cpu_freq_str},
+        {"id": 8,  "title": "메모리 사용 중","value": mem_in_use},
+        {"id": 9,  "title": "메모리 여유",   "value": mem_available},
+        {"id": 10, "title": "메모리 캐시",   "value": mem_cached},
+        {"id": 11, "title": "메모리 커밋",   "value": mem_committed},
+        {"id": 12, "title": "디스크 읽기",   "value": disk_read_str},
+        {"id": 13, "title": "디스크 쓰기",   "value": disk_write_str},
         {"id": 14, "title": "메모리 구성",   "value": _get_memory_hardware()},
     ]
 

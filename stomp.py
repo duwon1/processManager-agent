@@ -14,3 +14,11 @@ def extract_stomp_body(frame: str) -> str:
     if "\n\n" not in frame:
         return ""
     return frame.split("\n\n", 1)[1].rstrip("\x00")
+
+
+def extract_stomp_destination(frame: str) -> str:
+    """STOMP MESSAGE 프레임에서 destination 헤더 값을 추출합니다."""
+    for line in frame.split('\n'):
+        if line.startswith('destination:'):
+            return line[len('destination:'):].strip()
+    return ""
