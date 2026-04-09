@@ -6,8 +6,9 @@
 ## 주요 기능
 
 - **시스템 모니터링** - CPU, GPU, 메모리, 디스크, 네트워크 사용률을 2초 간격으로 전송
-- **프로세스 관리** - 프로세스 목록 조회 및 원격 종료(kill)
+- **프로세스 관리** - 프로세스 목록 조회 및 원격 종료(kill), 읽기/쓰기 속도(MB/s) 실시간 표시
 - **웹 터미널** - PTY 기반 쉘 세션 (브라우저에서 SSH처럼 사용)
+- **자동 업데이트** - 새 버전 감지 시 대시보드에서 원클릭 업데이트
 - **자동 재연결** - 백엔드 연결이 끊기면 5초 후 자동 재연결
 
 ## 기술 스택
@@ -18,50 +19,26 @@
 - websockets (STOMP over WebSocket)
 - PTY (가상 터미널)
 
-## 설치 및 실행
+## 설치
 
-```bash
-# 클론
-git clone https://github.com/duwon1/processManager-agent.git
-cd processManager-agent
 
-# 가상환경 생성
-python3 -m venv .venv
-source .venv/bin/activate
 
-# 의존성 설치
-pip install -r requirements.txt
-
-# .env 파일 생성
-cat > .env << EOF
-ACCOUNT_TOKEN=your_account_token
-SPRING_WS_URL=wss://your-backend-url/ws-native
-HOSTNAME=your-server-name
-OS_TYPE=Linux
-AGENT_PORT=8888
-EOF
-
-# 실행
-python main.py
-```
+설치 중 노드 이름 입력 프롬프트가 표시됩니다. 엔터를 누르면 시스템 호스트명이 자동으로 사용됩니다.
 
 ## 환경변수
 
 | 변수 | 필수 | 설명 | 기본값 |
 |------|------|------|--------|
 | ACCOUNT_TOKEN | O | 백엔드 인증 토큰 (메인 페이지에서 발급) | - |
-| SPRING_WS_URL | X | 백엔드 WebSocket URL | wss://...ngrok.../ws-native |
+| SPRING_WS_URL | O | 백엔드 WebSocket URL | - |
 | HOSTNAME | X | 서버 식별 이름 | 시스템 호스트명 |
 | OS_TYPE | X | OS 종류 | Linux |
 | AGENT_PORT | X | HTTP API 포트 | 8888 |
+| LINUX_API_RELOAD | X | FastAPI 개발 모드 리로드 | false |
 
 ## 동작 원리
 
-```
-에이전트 → (아웃바운드 WebSocket) → 백엔드 (Spring Boot)
-                                        ↕
-                                    브라우저 (React)
-```
+
 
 에이전트가 백엔드에 먼저 연결하므로 포트포워딩이나 공인 IP 없이도 작동합니다.
 
