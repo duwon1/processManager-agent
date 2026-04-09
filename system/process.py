@@ -10,35 +10,27 @@ from fastapi import APIRouter, HTTPException
 router = APIRouter(prefix="/process", tags=["Process"])
 
 CPU_COUNT = psutil.cpu_count() or 1
-PROCESS_LIMIT = None  # 한 번에 전송할 최대 프로세스 수 (None = 전체)
-CPU_SAMPLE_INTERVAL = 0.1  # CPU 사용률 측정을 위한 샘플링 대기 시간(초)
-MAX_CMDLINE_LENGTH = 160  # 명령행 문자열 최대 길이
-MAX_EXE_LENGTH = 120  # 실행 파일 경로 최대 길이
+PROCESS_LIMIT = None
+CPU_SAMPLE_INTERVAL = 0.1
+MAX_CMDLINE_LENGTH = 160
+MAX_EXE_LENGTH = 120
+
+# 이전 I/O 측정값 캐시: pid -> (prev_read_bytes, prev_write_bytes, timestamp)
+_io_cache: dict[int, tuple[float, float, float]] = {}
 
 
 def normalize_status(status: str | None) -> str:
-    """psutil 상태 문자열을 대시보드 표시용 표준 값으로 변환합니다."""
     status_map = {
-        "running": "running",
-        "sleeping": "sleeping",
-        "disk-sleep": "disk_sleep",
-        "stopped": "stopped",
-        "tracing-stop": "tracing_stop",
-        "zombie": "zombie",
-        "dead": "dead",
-        "wake-kill": "wake_kill",
-        "waking": "waking",
-        "parked": "parked",
-        "idle": "idle",
-        "locked": "locked",
-        "waiting": "waiting",
-        "suspended": "suspended",
+        "running": "running", "sleeping": "sleeping", "disk-sleep": "disk_sleep",
+        "stopped": "stopped", "tracing-stop": "tracing_stop", "zombie": "zombie",
+        "dead": "dead", "wake-kill": "wake_kill", "waking": "waking",
+        "parked": "parked", "idle": "idle", "locked": "locked",
+        "waiting": "waiting", "suspended": "suspended",
     }
     return status_map.get((status or "").lower(), (status or "unknown").lower())
 
 
 def truncate_text(value: str | None, max_length: int) -> str:
-    """문자열이 max_length를 초과하면 말줄임표(...)를 붙여 잘라 반환합니다."""
     if not value:
         return ""
     normalized = value.strip()
@@ -48,7 +40,6 @@ def truncate_text(value: str | None, max_length: int) -> str:
 
 
 def format_cmdline(cmdline: List[str] | None) -> str:
-    """프로세스 argv 목록을 공백으로 합친 뒤 최대 길이로 잘라 반환합니다."""
     if not cmdline:
         return ""
     joined = " ".join(part for part in cmdline if part).strip()
@@ -56,12 +47,10 @@ def format_cmdline(cmdline: List[str] | None) -> str:
 
 
 def format_exe_path(exe_path: str | None) -> str:
-    """실행 파일 경로를 최대 길이로 잘라 반환합니다."""
     return truncate_text(exe_path, MAX_EXE_LENGTH)
 
 
 def format_started_at(create_time: float | None) -> str | None:
-    """프로세스 생성 타임스탬프를 ISO 8601 형식 문자열로 변환합니다."""
     if not create_time:
         return None
     try:
@@ -70,24 +59,34 @@ def format_started_at(create_time: float | None) -> str | None:
         return None
 
 
-def get_io_totals(proc: psutil.Process) -> tuple[float, float]:
-    """프로세스의 누적 디스크 읽기·쓰기량을 MB 단위로 반환합니다.
-    권한 부족 등으로 조회 불가능한 경우 (0.0, 0.0)을 반환합니다.
+def get_io_speed(proc: psutil.Process) -> tuple[float, float]:
+    """프로세스의 디스크 읽기/쓰기 속도를 MB/s 단위로 반환합니다.
+    이전 측정값과의 차이를 경과 시간으로 나눠 초당 속도를 계산합니다.
+    첫 측정 또는 권한 부족 시 (0.0, 0.0)을 반환합니다.
     """
+    global _io_cache
+    pid = proc.pid
     try:
         io = proc.io_counters()
-        read_mb = round(io.read_bytes / (1024 * 1024), 2)
-        write_mb = round(io.write_bytes / (1024 * 1024), 2)
-        return read_mb, write_mb
+        now = time.time()
+        if pid in _io_cache:
+            prev_read, prev_write, prev_time = _io_cache[pid]
+            elapsed = now - prev_time
+            if elapsed > 0:
+                read_speed  = max(0.0, round((io.read_bytes  - prev_read)  / elapsed / (1024 * 1024), 2))
+                write_speed = max(0.0, round((io.write_bytes - prev_write) / elapsed / (1024 * 1024), 2))
+            else:
+                read_speed, write_speed = 0.0, 0.0
+        else:
+            read_speed, write_speed = 0.0, 0.0
+        _io_cache[pid] = (io.read_bytes, io.write_bytes, now)
+        return read_speed, write_speed
     except (psutil.AccessDenied, AttributeError, psutil.NoSuchProcess):
+        _io_cache.pop(pid, None)
         return 0.0, 0.0
 
 
 def prime_cpu_percent(processes: List[psutil.Process]) -> None:
-    """CPU 사용률 측정 전 기준값을 초기화합니다.
-    psutil은 두 번 호출 간의 차이로 CPU %를 계산하므로 첫 호출은 항상 0을 반환합니다.
-    샘플링 대기 후 실제 측정값을 얻을 수 있습니다.
-    """
     for proc in processes:
         try:
             proc.cpu_percent(interval=None)
@@ -97,9 +96,6 @@ def prime_cpu_percent(processes: List[psutil.Process]) -> None:
 
 
 def get_process_data() -> List[Dict]:
-    """실행 중인 프로세스 목록을 수집해 CPU 사용률 내림차순으로 정렬한 뒤 반환합니다.
-    PID 0(커널 유휴 프로세스)과 접근 불가 프로세스는 제외합니다.
-    """
     attrs = [
         "pid", "name", "username", "status",
         "memory_info", "memory_percent",
@@ -116,6 +112,12 @@ def get_process_data() -> List[Dict]:
 
     prime_cpu_percent(processes)
 
+    # 종료된 PID 캐시 정리 (메모리 누수 방지)
+    alive_pids = {proc.pid for proc in processes}
+    for dead_pid in list(_io_cache.keys()):
+        if dead_pid not in alive_pids:
+            del _io_cache[dead_pid]
+
     process_list = []
     for proc in processes:
         try:
@@ -124,8 +126,7 @@ def get_process_data() -> List[Dict]:
             mem_info = pinfo.get("memory_info")
             memory_mb = round((mem_info.rss if mem_info else 0) / (1024 * 1024), 2)
             memory_percent = round(pinfo.get("memory_percent") or 0.0, 1)
-            disk_read_mb, disk_write_mb = get_io_totals(proc)
-
+            disk_read_mb, disk_write_mb = get_io_speed(proc)
             process_list.append({
                 "pid": pinfo.get("pid"),
                 "name": pinfo.get("name") or "Unknown",
@@ -152,7 +153,6 @@ def get_process_data() -> List[Dict]:
 
 
 def kill_process_by_pid(pid: int) -> str:
-    """SIGKILL로 프로세스를 즉시 강제 종료합니다."""
     try:
         os.kill(pid, signal.SIGKILL)
         return f"PID {pid} 종료했습니다."
@@ -164,11 +164,9 @@ def kill_process_by_pid(pid: int) -> str:
 
 @router.get("/all", response_model=List[Dict])
 def get_all_processes_http():
-    """현재 프로세스 목록을 HTTP로 즉시 조회합니다. 디버깅용으로 사용합니다."""
     return get_process_data()
 
 
 @router.delete("/{pid}")
 def kill_process(pid: int):
-    """PID로 프로세스를 종료합니다. WebSocket 흐름과 동일한 kill 함수를 사용합니다."""
     return {"message": kill_process_by_pid(pid)}
