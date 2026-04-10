@@ -15,7 +15,7 @@ COMMAND_SUBSCRIPTION_ID = "agent-command-channel"
 SYSINFO_SUBSCRIPTION_ID = "sysinfo-request-channel"
 
 
-async def run_agent(url: str, account_token: str, hostname: str, os_type: str) -> None:
+async def run_agent(url: str, account_token: str, hostname: str, os_type: str, agent_id: str = "") -> None:
     """단일 WebSocket 연결로 모니터링·프로세스 전송·kill 명령·터미널을 모두 처리합니다."""
     self_ip = metrics.get_self_ip()
     print(f"[에이전트] STOMP 연결 시도: {url}")
@@ -32,6 +32,7 @@ async def run_agent(url: str, account_token: str, hostname: str, os_type: str) -
                         "account-token": account_token,
                         "hostname": hostname,
                         "os-type": os_type,
+                        "agent-id": agent_id,
                         "self-ip": self_ip,
                     },
                 ))

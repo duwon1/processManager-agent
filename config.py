@@ -30,6 +30,7 @@ class Settings:
     os_type: str
     port: int
     reload: bool
+    agent_id: str  # 에이전트 고유 UUID (재설치 시 동일 노드 식별)
 
 
 def get_settings() -> Settings:
@@ -52,6 +53,7 @@ def get_settings() -> Settings:
     os_type        = os.getenv("OS_TYPE", "Linux")
     port           = int(os.getenv("AGENT_PORT", "8888"))
     reload_enabled = os.getenv("LINUX_API_RELOAD", "false").lower() == "true"
+    agent_id       = os.getenv("AGENT_ID", "").strip()
 
     return Settings(
         websocket_url=websocket_url,
@@ -60,5 +62,5 @@ def get_settings() -> Settings:
         os_type=os_type,
         port=port,
         reload=reload_enabled,
+        agent_id=agent_id,
     )
-

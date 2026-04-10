@@ -21,9 +21,10 @@ async def lifespan(app: FastAPI):
     print("에이전트 기동이 완료되었습니다.")
     print(f"WebSocket 대상 서버: {settings.websocket_url}")
     print(f"에이전트 호스트명: {settings.hostname}")
+    print(f"에이전트 ID: {settings.agent_id}")
 
     agent_task = asyncio.create_task(
-        run_agent(settings.websocket_url, settings.account_token, settings.hostname, settings.os_type)
+        run_agent(settings.websocket_url, settings.account_token, settings.hostname, settings.os_type, settings.agent_id)
     )
     yield
 
