@@ -16,7 +16,15 @@ COMMAND_SUBSCRIPTION_ID = "agent-command-channel"
 SYSINFO_SUBSCRIPTION_ID = "sysinfo-request-channel"
 
 
-async def run_agent(url: str, account_token: str, hostname: str, os_type: str, agent_id: str = "", service_name: str = "processmanager-agent") -> None:
+async def run_agent(
+    url: str,
+    account_token: str,
+    hostname: str,
+    os_type: str,
+    agent_id: str = "",
+    service_name: str = "processmanager-agent",
+    agent_secret: str = "",
+) -> None:
     """단일 WebSocket 연결로 모니터링·프로세스 전송·kill 명령·터미널을 모두 처리합니다."""
     self_ip = metrics.get_self_ip()
     print(f"[에이전트] STOMP 연결 시도: {url}")
@@ -24,19 +32,20 @@ async def run_agent(url: str, account_token: str, hostname: str, os_type: str, a
     while True:
         try:
             async with websockets.connect(url) as websocket:
-                # STOMP CONNECT
-                await websocket.send(stomp_frame(
-                    "CONNECT",
-                    {
-                        "accept-version": "1.1,1.2",
-                        "host": "localhost",
-                        "account-token": account_token,
-                        "hostname": hostname,
-                        "os-type": os_type,
-                        "agent-id": agent_id,
-                        "self-ip": self_ip,
-                    },
-                ))
+                # 등록된 노드는 agent-secret을 우선 사용하고, 최초 등록/재설치는 account-token을 사용합니다.
+                connect_headers = {
+                    "accept-version": "1.1,1.2",
+                    "host": "localhost",
+                    "hostname": hostname,
+                    "os-type": os_type,
+                    "agent-id": agent_id,
+                    "self-ip": self_ip,
+                }
+                if agent_secret:
+                    connect_headers["agent-secret"] = agent_secret
+                else:
+                    connect_headers["account-token"] = account_token
+                await websocket.send(stomp_frame("CONNECT", connect_headers))
                 resp = await websocket.recv()
                 if not str(resp).startswith("CONNECTED"):
                     raise RuntimeError(f"STOMP CONNECT 실패: {resp}")
@@ -52,6 +61,16 @@ async def run_agent(url: str, account_token: str, hostname: str, os_type: str, a
                     },
                 ))
 
+                # 노드 전용 secret 수신 채널 구독
+                await websocket.send(stomp_frame(
+                    "SUBSCRIBE",
+                    {
+                        "id": "agent-secret-channel",
+                        "destination": f"/topic/agent.secret.{agent_id}",
+                        "ack": "auto",
+                    },
+                ))
+
                 # 시스템 정보 수집 요청 채널 구독
                 await websocket.send(stomp_frame(
                     "SUBSCRIBE",
@@ -62,6 +81,14 @@ async def run_agent(url: str, account_token: str, hostname: str, os_type: str, a
                     },
                 ))
                 print("[에이전트] 시스템 정보 요청 채널 구독 시작")
+
+                if not agent_secret:
+                    # 등록 직후 서버가 발급한 agent-secret을 받을 준비가 끝났음을 알립니다.
+                    await websocket.send(stomp_frame(
+                        "SEND",
+                        {"destination": "/app/agent.register-ready", "content-type": "application/json"},
+                        json.dumps({"nodeName": hostname, "agentId": agent_id}),
+                    ))
 
                 async def send_monitoring_loop():
                     """시스템 메트릭을 2초 간격으로 전송합니다."""
@@ -156,6 +183,7 @@ async def run_agent(url: str, account_token: str, hostname: str, os_type: str, a
 
                 async def receive_commands_loop():
                     """백엔드에서 오는 명령(kill·터미널·시스템 정보·서비스 제어)을 수신하고 처리합니다."""
+                    nonlocal agent_secret
                     while True:
                         frame = await websocket.recv()
                         frame_text = str(frame)
@@ -193,6 +221,31 @@ async def run_agent(url: str, account_token: str, hostname: str, os_type: str, a
 
                         cmd_type = payload.get("type", "")
 
+                        if cmd_type == "agent-secret":
+                            if payload.get("nodeName") == hostname and payload.get("agentId") == agent_id:
+                                new_secret = str(payload.get("agentSecret", "")).strip()
+                                if new_secret:
+                                    # 서버가 발급한 노드 전용 secret을 .env에 저장해 다음 재접속부터 account-token을 쓰지 않습니다.
+                                    import os
+                                    env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
+                                    lines = []
+                                    found = False
+                                    if os.path.exists(env_path):
+                                        with open(env_path, "r", encoding="utf-8") as fh:
+                                            for line in fh.read().splitlines():
+                                                if line.startswith("AGENT_SECRET="):
+                                                    lines.append(f"AGENT_SECRET={new_secret}")
+                                                    found = True
+                                                else:
+                                                    lines.append(line)
+                                    if not found:
+                                        lines.append(f"AGENT_SECRET={new_secret}")
+                                    with open(env_path, "w", encoding="utf-8") as fh:
+                                        fh.write("\n".join(lines) + "\n")
+                                    agent_secret = new_secret
+                                    print("[agent] agent secret saved")
+                            continue
+
                         # ── 서비스 제어 명령 ──
                         if cmd_type == "service-control":
                             if payload.get("nodeName") != hostname:
@@ -215,6 +268,71 @@ async def run_agent(url: str, account_token: str, hostname: str, os_type: str, a
                                     "message": message,
                                     "nodeName": hostname,
                                 }),
+                            ))
+                            continue
+
+                        # ── 파일 목록 요청 처리 ──
+                        if cmd_type == "file-list":
+                            if payload.get("nodeName") != hostname:
+                                continue
+                            try:
+                                import os
+                                from pathlib import Path
+
+                                requested_path = str(payload.get("path", "") or "").strip()
+                                target = Path(requested_path).expanduser() if requested_path else Path.home()
+                                if not target.is_absolute():
+                                    target = (Path.home() / target).resolve()
+                                else:
+                                    target = target.resolve()
+
+                                entries = []
+                                if target.is_dir():
+                                    for child in sorted(target.iterdir(), key=lambda p: (not p.is_dir(), p.name.lower())):
+                                        try:
+                                            stat = child.stat()
+                                            entries.append({
+                                                "name": child.name,
+                                                "path": str(child),
+                                                "type": "directory" if child.is_dir() else "file",
+                                                "size": stat.st_size,
+                                                "modified": int(stat.st_mtime),
+                                                "hidden": child.name.startswith("."),
+                                            })
+                                        except OSError:
+                                            entries.append({
+                                                "name": child.name,
+                                                "path": str(child),
+                                                "type": "unknown",
+                                                "size": 0,
+                                                "modified": 0,
+                                                "hidden": child.name.startswith("."),
+                                            })
+                                    response = {
+                                        "path": str(target),
+                                        "parent": str(target.parent) if target.parent != target else "",
+                                        "entries": entries,
+                                        "error": "",
+                                    }
+                                else:
+                                    response = {
+                                        "path": str(target),
+                                        "parent": str(target.parent),
+                                        "entries": [],
+                                        "error": "디렉토리가 아닙니다.",
+                                    }
+                            except Exception as e:
+                                response = {
+                                    "path": str(payload.get("path", "") or ""),
+                                    "parent": "",
+                                    "entries": [],
+                                    "error": str(e),
+                                }
+
+                            await websocket.send(stomp_frame(
+                                "SEND",
+                                {"destination": "/app/file-list.result", "content-type": "application/json"},
+                                json.dumps(response),
                             ))
                             continue
 

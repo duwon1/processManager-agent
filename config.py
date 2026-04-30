@@ -31,6 +31,7 @@ class Settings:
     port: int
     reload: bool
     agent_id: str  # 에이전트 고유 UUID (재설치 시 동일 노드 식별)
+    agent_secret: str  # 등록 후 재접속에 사용하는 노드 전용 secret
     instance: str   # install instance name such as dev/prod
     service_name: str  # systemd service name controlled during update/uninstall
 
@@ -56,6 +57,7 @@ def get_settings() -> Settings:
     port           = int(os.getenv("AGENT_PORT", "8888"))
     reload_enabled = os.getenv("LINUX_API_RELOAD", "false").lower() == "true"
     agent_id       = os.getenv("AGENT_ID", "").strip()
+    agent_secret   = os.getenv("AGENT_SECRET", "").strip()
     instance       = os.getenv("INSTANCE", "default").strip()
     service_name   = os.getenv("SERVICE_NAME", "processmanager-agent").strip()
 
@@ -67,6 +69,7 @@ def get_settings() -> Settings:
         port=port,
         reload=reload_enabled,
         agent_id=agent_id,
+        agent_secret=agent_secret,
         instance=instance,
         service_name=service_name,
     )
