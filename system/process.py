@@ -59,10 +59,10 @@ def format_started_at(create_time: float | None) -> str | None:
         return None
 
 
-def get_io_speed(proc: psutil.Process) -> tuple[float, float]:
-    """프로세스의 디스크 읽기/쓰기 속도를 MB/s 단위로 반환합니다.
+def get_io_speed(proc: psutil.Process) -> tuple[int, int]:
+    """프로세스의 디스크 읽기/쓰기 속도를 bytes/sec 단위로 반환합니다.
     이전 측정값과의 차이를 경과 시간으로 나눠 초당 속도를 계산합니다.
-    첫 측정 또는 권한 부족 시 (0.0, 0.0)을 반환합니다.
+    첫 측정 또는 권한 부족 시 (0, 0)을 반환합니다.
     """
     global _io_cache
     pid = proc.pid
@@ -73,17 +73,17 @@ def get_io_speed(proc: psutil.Process) -> tuple[float, float]:
             prev_read, prev_write, prev_time = _io_cache[pid]
             elapsed = now - prev_time
             if elapsed > 0:
-                read_speed  = max(0.0, round((io.read_bytes  - prev_read)  / elapsed / (1024 * 1024), 2))
-                write_speed = max(0.0, round((io.write_bytes - prev_write) / elapsed / (1024 * 1024), 2))
+                read_speed = int(max(0, (io.read_bytes - prev_read) / elapsed))
+                write_speed = int(max(0, (io.write_bytes - prev_write) / elapsed))
             else:
-                read_speed, write_speed = 0.0, 0.0
+                read_speed, write_speed = 0, 0
         else:
-            read_speed, write_speed = 0.0, 0.0
+            read_speed, write_speed = 0, 0
         _io_cache[pid] = (io.read_bytes, io.write_bytes, now)
         return read_speed, write_speed
     except (psutil.AccessDenied, AttributeError, psutil.NoSuchProcess):
         _io_cache.pop(pid, None)
-        return 0.0, 0.0
+        return 0, 0
 
 
 def prime_cpu_percent(processes: List[psutil.Process]) -> None:
@@ -124,19 +124,19 @@ def get_process_data() -> List[Dict]:
             pinfo = proc.info
             cpu_percent = round(proc.cpu_percent(interval=None) / CPU_COUNT, 1)
             mem_info = pinfo.get("memory_info")
-            memory_mb = round((mem_info.rss if mem_info else 0) / (1024 * 1024), 2)
+            memory_bytes = mem_info.rss if mem_info else 0
             memory_percent = round(pinfo.get("memory_percent") or 0.0, 1)
-            disk_read_mb, disk_write_mb = get_io_speed(proc)
+            disk_read_bps, disk_write_bps = get_io_speed(proc)
             process_list.append({
                 "pid": pinfo.get("pid"),
                 "name": pinfo.get("name") or "Unknown",
                 "username": pinfo.get("username") or "-",
                 "status": normalize_status(pinfo.get("status")),
                 "cpu_percent": max(cpu_percent, 0.0),
-                "memory_mb": memory_mb,
+                "memory_bytes": memory_bytes,
                 "memory_percent": memory_percent,
-                "disk_read_mb": disk_read_mb,
-                "disk_write_mb": disk_write_mb,
+                "disk_read_bytes_per_second": disk_read_bps,
+                "disk_write_bytes_per_second": disk_write_bps,
                 "thread_count": pinfo.get("num_threads") or 0,
                 "started_at": format_started_at(pinfo.get("create_time")),
                 "cmdline": format_cmdline(pinfo.get("cmdline")),
@@ -147,7 +147,7 @@ def get_process_data() -> List[Dict]:
 
     return sorted(
         process_list,
-        key=lambda item: (item["cpu_percent"], item["memory_mb"]),
+        key=lambda item: (item["cpu_percent"], item["memory_bytes"]),
         reverse=True,
     )[:PROCESS_LIMIT]
 

@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import platform
 import socket
-import time
 from typing import Any
 
 import psutil
@@ -13,38 +12,6 @@ from system import hardware as legacy_hardware
 
 
 SCHEMA_VERSION = 1
-
-
-def _parse_size(value: Any) -> int | None:
-    """사람이 읽는 크기 문자열을 bytes 숫자로 정규화합니다."""
-    text = str(value or "").strip()
-    if not text or text.upper() == "N/A":
-        return None
-    try:
-        number = float(text.split()[0])
-    except (IndexError, ValueError):
-        return None
-
-    upper = text.upper()
-    if "TB" in upper:
-        return int(number * 1024 ** 4)
-    if "GB" in upper:
-        return int(number * 1024 ** 3)
-    if "MB" in upper:
-        return int(number * 1024 ** 2)
-    if "KB" in upper:
-        return int(number * 1024)
-    if " B" in upper or upper.endswith("B"):
-        return int(number)
-    return None
-
-
-def _parse_mhz(value: Any) -> float | None:
-    """MHz 표시 문자열을 숫자 값으로 정규화합니다."""
-    try:
-        return float(str(value).replace("MHz", "").strip())
-    except (TypeError, ValueError):
-        return None
 
 
 def _item(key: str, value: Any, unit: str = "text") -> dict[str, Any]:
@@ -58,16 +25,11 @@ def _item(key: str, value: Any, unit: str = "text") -> dict[str, Any]:
 
 
 def _section(key: str, items: list[dict[str, Any]], groups: list[dict[str, Any]] | None = None) -> dict[str, Any]:
-    """프론트가 한글 라벨을 붙여 렌더링할 section payload를 만듭니다."""
+    """프론트가 한글 라벨과 표시 단위를 붙여 렌더링할 section payload를 만듭니다."""
     payload: dict[str, Any] = {"key": key, "items": items}
     if groups:
         payload["groups"] = groups
     return payload
-
-
-def _uptime_seconds() -> int:
-    """부팅 이후 경과 시간을 seconds 단위로 반환합니다."""
-    return int(time.time() - psutil.boot_time())
 
 
 def _disk_groups(disks: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -82,10 +44,12 @@ def _disk_groups(disks: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 _item("mountpoint", disk.get("mountpoint")),
                 _item("device", disk.get("device")),
                 _item("filesystem", disk.get("fstype")),
-                _item("totalBytes", _parse_size(disk.get("total")), "bytes"),
-                _item("usedBytes", _parse_size(disk.get("used")), "bytes"),
-                _item("freeBytes", _parse_size(disk.get("free")), "bytes"),
-                _item("usagePercent", disk.get("percent"), "percent"),
+                _item("totalBytes", disk.get("totalBytes"), "bytes"),
+                _item("usedBytes", disk.get("usedBytes"), "bytes"),
+                _item("freeBytes", disk.get("freeBytes"), "bytes"),
+                _item("usagePercent", disk.get("usagePercent"), "percent"),
+                _item("readBytesPerSecond", disk.get("readBytesPerSecond"), "bytesPerSecond"),
+                _item("writeBytesPerSecond", disk.get("writeBytesPerSecond"), "bytesPerSecond"),
                 _item("diskType", disk.get("type")),
                 _item("model", disk.get("model")),
             ],
@@ -108,7 +72,7 @@ def _network_groups(networks: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 _item("ipv6", network.get("ipv6")),
                 _item("model", network.get("model")),
                 _item("ssid", network.get("ssid")),
-                _item("signalStrength", network.get("signalStrength")),
+                _item("signalStrengthDbm", network.get("signalStrengthDbm"), "dbm"),
             ],
         })
     return groups
@@ -125,8 +89,9 @@ def _gpu_groups(gpus: list[dict[str, Any]]) -> list[dict[str, Any]]:
             "items": [
                 _item("model", gpu.get("model")),
                 _item("driverVersion", gpu.get("driverVersion")),
-                _item("dedicatedMemoryBytes", _parse_size(gpu.get("dedicatedMemory")), "bytes"),
-                _item("sharedMemory", gpu.get("sharedMemory")),
+                _item("dedicatedMemoryBytes", gpu.get("dedicatedMemoryBytes"), "bytes"),
+                _item("usedMemoryBytes", gpu.get("usedMemoryBytes"), "bytes"),
+                _item("sharedMemoryBytes", gpu.get("sharedMemoryBytes"), "bytes"),
             ],
         })
     return groups
@@ -134,8 +99,7 @@ def _gpu_groups(gpus: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 def _summary(legacy: dict[str, Any]) -> dict[str, Any]:
     """공통 차트/알림에서 쓰기 쉬운 표준 단위 summary를 생성합니다."""
-    memory = psutil.virtual_memory()
-    swap = psutil.swap_memory()
+    memory = legacy.get("memory", {})
     cpu = legacy.get("cpu", {})
 
     return {
@@ -143,25 +107,23 @@ def _summary(legacy: dict[str, Any]) -> dict[str, Any]:
             "model": cpu.get("model"),
             "cores": cpu.get("cores"),
             "logicalProcessors": cpu.get("logicalProcessors"),
-            "baseSpeedMhz": _parse_mhz(cpu.get("baseSpeedMhz")),
-            "uptimeSeconds": _uptime_seconds(),
+            "baseSpeedMhz": cpu.get("baseSpeedMhz"),
+            "uptimeSeconds": cpu.get("uptimeSeconds"),
         },
         "memory": {
-            "totalBytes": memory.total,
-            "usedBytes": memory.used,
-            "availableBytes": memory.available,
-            "usagePercent": memory.percent,
-            "swapTotalBytes": swap.total,
-            "swapUsedBytes": swap.used,
+            "totalBytes": memory.get("totalBytes"),
+            "usedBytes": memory.get("inUseBytes"),
+            "availableBytes": memory.get("availableBytes"),
+            "usagePercent": memory.get("usagePercent"),
         },
         "disks": [
             {
                 "mountpoint": disk.get("mountpoint"),
                 "device": disk.get("device"),
-                "totalBytes": _parse_size(disk.get("total")),
-                "usedBytes": _parse_size(disk.get("used")),
-                "freeBytes": _parse_size(disk.get("free")),
-                "usagePercent": disk.get("percent"),
+                "totalBytes": disk.get("totalBytes"),
+                "usedBytes": disk.get("usedBytes"),
+                "freeBytes": disk.get("freeBytes"),
+                "usagePercent": disk.get("usagePercent"),
             }
             for disk in legacy.get("disks", [])
         ],
@@ -177,11 +139,9 @@ def _summary(legacy: dict[str, Any]) -> dict[str, Any]:
 
 
 def _sections(legacy: dict[str, Any]) -> list[dict[str, Any]]:
-    """Linux 전용 상세 정보를 프론트 표시용 section 배열로 구성합니다."""
+    """Linux 전용 상세 정보를 표준 단위 section 배열로 구성합니다."""
     cpu = legacy.get("cpu", {})
     memory = legacy.get("memory", {})
-    virtual_memory = psutil.virtual_memory()
-    swap = psutil.swap_memory()
 
     return [
         _section("linux.system", [
@@ -191,29 +151,29 @@ def _sections(legacy: dict[str, Any]) -> list[dict[str, Any]]:
             _item("kernelVersion", platform.version()),
             _item("architecture", platform.machine()),
             _item("bootTimeEpochSeconds", int(psutil.boot_time()), "epochSeconds"),
-            _item("uptimeSeconds", _uptime_seconds(), "seconds"),
+            _item("uptimeSeconds", cpu.get("uptimeSeconds"), "seconds"),
         ]),
         _section("linux.cpu", [
             _item("model", cpu.get("model")),
             _item("sockets", cpu.get("sockets"), "count"),
             _item("cores", cpu.get("cores"), "count"),
             _item("logicalProcessors", cpu.get("logicalProcessors"), "count"),
-            _item("baseSpeedMhz", _parse_mhz(cpu.get("baseSpeedMhz")), "mhz"),
-            _item("currentSpeedMhz", _parse_mhz(cpu.get("currentSpeedMhz")), "mhz"),
+            _item("baseSpeedMhz", cpu.get("baseSpeedMhz"), "mhz"),
+            _item("currentSpeedMhz", cpu.get("currentSpeedMhz"), "mhz"),
             _item("virtualization", cpu.get("virtualization")),
-            _item("l1Cache", cpu.get("l1Cache")),
-            _item("l2Cache", cpu.get("l2Cache")),
-            _item("l3Cache", cpu.get("l3Cache")),
+            _item("l1CacheBytes", cpu.get("l1CacheBytes"), "bytes"),
+            _item("l2CacheBytes", cpu.get("l2CacheBytes"), "bytes"),
+            _item("l3CacheBytes", cpu.get("l3CacheBytes"), "bytes"),
         ]),
         _section("linux.memory", [
-            _item("totalBytes", virtual_memory.total, "bytes"),
-            _item("usedBytes", virtual_memory.used, "bytes"),
-            _item("availableBytes", virtual_memory.available, "bytes"),
-            _item("cachedBytes", getattr(virtual_memory, "cached", 0) or 0, "bytes"),
-            _item("usagePercent", virtual_memory.percent, "percent"),
-            _item("swapTotalBytes", swap.total, "bytes"),
-            _item("swapUsedBytes", swap.used, "bytes"),
-            _item("speedMhz", memory.get("speedMhz")),
+            _item("totalBytes", memory.get("totalBytes"), "bytes"),
+            _item("usedBytes", memory.get("inUseBytes"), "bytes"),
+            _item("availableBytes", memory.get("availableBytes"), "bytes"),
+            _item("cachedBytes", memory.get("cachedBytes"), "bytes"),
+            _item("committedBytes", memory.get("committedBytes"), "bytes"),
+            _item("commitLimitBytes", memory.get("commitLimitBytes"), "bytes"),
+            _item("usagePercent", memory.get("usagePercent"), "percent"),
+            _item("speedMtPerSecond", memory.get("speedMtPerSecond"), "mtPerSecond"),
             _item("slotsUsed", memory.get("slotsUsed"), "count"),
             _item("formFactor", memory.get("formFactor")),
         ]),
