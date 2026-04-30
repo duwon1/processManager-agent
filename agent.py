@@ -391,15 +391,26 @@ async def run_agent(
                             print("[agent] update command received; starting self-update")
                             await report_update_result("started", True, "업데이트 명령 수신")
                             agent_dir = os.path.dirname(os.path.abspath(__file__))
-                            # 인스턴스별 service_name과 agent_dir를 사용해 개발/운영 에이전트가 서로 덮어쓰지 않게 합니다.
-                            safe_service_name = shlex.quote(service_name)
+                            # git pull과 의존성 설치를 현재 프로세스에서 끝낸 뒤 종료하면 systemd가 새 코드로 재시작합니다.
                             safe_agent_dir = shlex.quote(agent_dir)
                             cmds = ' && '.join([
                                 f'git -C {safe_agent_dir} pull origin master',
                                 f'{safe_agent_dir}/.venv/bin/pip install -r {safe_agent_dir}/requirements.txt -q',
-                                f'sudo systemctl restart {safe_service_name} 2>/dev/null || true',
                             ])
-                            subprocess.Popen(['bash', '-c', f'sleep 1 && {cmds}'])
+                            update_result = await asyncio.to_thread(
+                                subprocess.run,
+                                ['bash', '-lc', cmds],
+                                text=True,
+                                capture_output=True,
+                                timeout=120,
+                                check=False,
+                            )
+                            if update_result.returncode != 0:
+                                error_message = (update_result.stderr or update_result.stdout or "업데이트 실패").strip()
+                                await report_update_result("failed", False, error_message[-400:])
+                                print(f"[agent] update failed: {error_message}")
+                                continue
+                            await report_update_result("pulled", True, "업데이트 적용 후 재시작")
                             raise SystemExit(0)
                             continue
 
