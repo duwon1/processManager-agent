@@ -1,4 +1,5 @@
 import os
+import platform as py_platform
 import socket
 from dataclasses import dataclass
 from pathlib import Path
@@ -53,7 +54,7 @@ def get_settings() -> Settings:
         raise RuntimeError("ACCOUNT_TOKEN이 없습니다. 설치 시 토큰을 주입해주세요.")
 
     hostname       = os.getenv("HOSTNAME", socket.gethostname() or "Linux-Server")
-    os_type        = os.getenv("OS_TYPE", "Linux")
+    os_type        = os.getenv("OS_TYPE", py_platform.system() or "Linux")
     port           = int(os.getenv("AGENT_PORT", "8888"))
     reload_enabled = os.getenv("LINUX_API_RELOAD", "false").lower() == "true"
     agent_id       = os.getenv("AGENT_ID", "").strip()

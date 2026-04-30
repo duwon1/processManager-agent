@@ -4,15 +4,13 @@
 import asyncio
 import json
 import os
-import shlex
 import subprocess
 
 import websockets
 from fastapi import HTTPException
 
+from pm_agent.platforms.factory import get_platform_adapter
 from stomp import stomp_frame, extract_stomp_body, extract_stomp_destination
-from terminal import terminal_manager
-from system import metrics, process, hardware, services
 
 COMMAND_SUBSCRIPTION_ID = "agent-command-channel"
 SYSINFO_SUBSCRIPTION_ID = "sysinfo-request-channel"
@@ -52,7 +50,9 @@ async def run_agent(
     agent_secret: str = "",
 ) -> None:
     """단일 WebSocket 연결로 모니터링·프로세스 전송·kill 명령·터미널을 모두 처리합니다."""
-    self_ip = metrics.get_self_ip()
+    # 서버 통신은 공통으로 유지하고, OS 의존 기능은 adapter를 통해 실행합니다.
+    platform_adapter = get_platform_adapter(os_type)
+    self_ip = platform_adapter.get_self_ip()
     print(f"[에이전트] STOMP 연결 시도: {url}")
 
     while True:
@@ -67,6 +67,9 @@ async def run_agent(
                     "agent-id": agent_id,
                     "self-ip": self_ip,
                 }
+                if getattr(platform_adapter, "capabilities", None):
+                    # 서버가 아직 capability를 저장하지 않아도 무시 가능한 보조 헤더로 전송합니다.
+                    connect_headers["capabilities"] = json.dumps(platform_adapter.capabilities, separators=(",", ":"))
                 if agent_secret:
                     connect_headers["agent-secret"] = agent_secret
                 else:
@@ -140,7 +143,7 @@ async def run_agent(
                 async def send_monitoring_loop():
                     """시스템 메트릭을 2초 간격으로 전송합니다."""
                     while True:
-                        data = metrics.collect_system_metrics()
+                        data = platform_adapter.collect_metrics()
                         await websocket.send(stomp_frame(
                             "SEND",
                             {"destination": "/app/monitoring", "content-type": "application/json"},
@@ -151,7 +154,7 @@ async def run_agent(
                 async def send_process_loop():
                     """프로세스 목록을 2초 간격으로 전송합니다."""
                     while True:
-                        data = process.get_process_data()
+                        data = platform_adapter.list_processes()
                         await websocket.send(stomp_frame(
                             "SEND",
                             {"destination": "/app/process", "content-type": "application/json"},
@@ -163,7 +166,7 @@ async def run_agent(
                     """서비스 목록을 10초 간격으로 전송합니다."""
                     while True:
                         try:
-                            svc_list = services.get_service_list()
+                            svc_list = platform_adapter.list_services()
                             await websocket.send(stomp_frame(
                                 "SEND",
                                 {"destination": "/app/service", "content-type": "application/json"},
@@ -176,7 +179,7 @@ async def run_agent(
                 async def send_terminal_output_loop():
                     """모든 활성 터미널 세션의 PTY 출력을 STOMP으로 전송합니다."""
                     while True:
-                        for session_id, queue in terminal_manager.get_all_queues():
+                        for session_id, queue in platform_adapter.iter_terminal_queues():
                             chunks = []
                             while not queue.empty():
                                 try:
@@ -249,7 +252,7 @@ async def run_agent(
                             if payload.get("nodeName") == hostname:
                                 try:
                                     loop = asyncio.get_event_loop()
-                                    info = await loop.run_in_executor(None, hardware.collect)
+                                    info = await loop.run_in_executor(None, platform_adapter.collect_hardware)
                                     info["nodeId"] = payload.get("nodeId")
                                     await websocket.send(stomp_frame(
                                         "SEND",
@@ -295,7 +298,7 @@ async def run_agent(
                             svc_name = payload.get("name", "")
                             action = payload.get("action", "")
                             try:
-                                message = services.control_service(svc_name, action)
+                                message = platform_adapter.control_service(svc_name, action)
                                 success = True
                             except Exception as e:
                                 message = str(e)
@@ -318,51 +321,7 @@ async def run_agent(
                             if payload.get("nodeName") != hostname:
                                 continue
                             try:
-                                import os
-                                from pathlib import Path
-
-                                requested_path = str(payload.get("path", "") or "").strip()
-                                target = Path(requested_path).expanduser() if requested_path else Path.home()
-                                if not target.is_absolute():
-                                    target = (Path.home() / target).resolve()
-                                else:
-                                    target = target.resolve()
-
-                                entries = []
-                                if target.is_dir():
-                                    for child in sorted(target.iterdir(), key=lambda p: (not p.is_dir(), p.name.lower())):
-                                        try:
-                                            stat = child.stat()
-                                            entries.append({
-                                                "name": child.name,
-                                                "path": str(child),
-                                                "type": "directory" if child.is_dir() else "file",
-                                                "size": stat.st_size,
-                                                "modified": int(stat.st_mtime),
-                                                "hidden": child.name.startswith("."),
-                                            })
-                                        except OSError:
-                                            entries.append({
-                                                "name": child.name,
-                                                "path": str(child),
-                                                "type": "unknown",
-                                                "size": 0,
-                                                "modified": 0,
-                                                "hidden": child.name.startswith("."),
-                                            })
-                                    response = {
-                                        "path": str(target),
-                                        "parent": str(target.parent) if target.parent != target else "",
-                                        "entries": entries,
-                                        "error": "",
-                                    }
-                                else:
-                                    response = {
-                                        "path": str(target),
-                                        "parent": str(target.parent),
-                                        "entries": [],
-                                        "error": "디렉토리가 아닙니다.",
-                                    }
+                                response = platform_adapter.list_files(str(payload.get("path", "") or ""))
                             except Exception as e:
                                 response = {
                                     "path": str(payload.get("path", "") or ""),
@@ -391,24 +350,10 @@ async def run_agent(
                             print("[agent] update command received; starting self-update")
                             await report_update_result("started", True, "업데이트 명령 수신")
                             agent_dir = os.path.dirname(os.path.abspath(__file__))
-                            # git pull과 의존성 설치를 현재 프로세스에서 끝낸 뒤 종료하면 systemd가 새 코드로 재시작합니다.
-                            safe_agent_dir = shlex.quote(agent_dir)
-                            cmds = ' && '.join([
-                                f'git -C {safe_agent_dir} pull origin master',
-                                f'{safe_agent_dir}/.venv/bin/pip install -r {safe_agent_dir}/requirements.txt -q',
-                            ])
-                            update_result = await asyncio.to_thread(
-                                subprocess.run,
-                                ['bash', '-lc', cmds],
-                                text=True,
-                                capture_output=True,
-                                timeout=120,
-                                check=False,
-                            )
-                            if update_result.returncode != 0:
-                                error_message = (update_result.stderr or update_result.stdout or "업데이트 실패").strip()
-                                await report_update_result("failed", False, error_message[-400:])
-                                print(f"[agent] update failed: {error_message}")
+                            update_success, update_message = await platform_adapter.self_update(agent_dir)
+                            if not update_success:
+                                await report_update_result("failed", False, update_message[-400:])
+                                print(f"[agent] update failed: {update_message}")
                                 continue
                             await report_update_result("pulled", True, "업데이트 적용 후 재시작")
                             raise SystemExit(0)
@@ -429,24 +374,14 @@ async def run_agent(
                                     }),
                                 ))
                                 print("[agent] uninstall ack sent; starting self-removal")
-                                import subprocess, os
                                 agent_dir = os.path.dirname(os.path.abspath(__file__))
-                                safe_service_name = shlex.quote(service_name)
-                                safe_agent_dir = shlex.quote(agent_dir)
-                                cmds = ' && '.join([
-                                    f'sudo systemctl disable {safe_service_name} 2>/dev/null || true',
-                                    f'sudo systemctl stop {safe_service_name} 2>/dev/null || true',
-                                    f'sudo rm -f /etc/systemd/system/{safe_service_name}.service 2>/dev/null || true',
-                                    'sudo systemctl daemon-reload 2>/dev/null || true',
-                                    f'rm -rf {safe_agent_dir}',
-                                ])
-                                subprocess.Popen(['bash', '-c', f'sleep 2 && {cmds}'])
+                                platform_adapter.start_self_uninstall(agent_dir, service_name)
                                 raise SystemExit(0)
                             continue
 
                         # Terminal command handling
                         if cmd_type.startswith("terminal-"):
-                            _handle_terminal_command(payload, cmd_type, hostname)
+                            _handle_terminal_command(payload, cmd_type, hostname, platform_adapter)
                             continue
 
                         # ── kill 명령 처리 ──
@@ -459,7 +394,7 @@ async def run_agent(
                             continue
 
                         try:
-                            message = process.kill_process_by_pid(pid)
+                            message = platform_adapter.kill_process(pid)
                             success = True
                         except HTTPException as exc:
                             message = exc.detail
@@ -477,7 +412,7 @@ async def run_agent(
                             }),
                         ))
 
-                        fresh = process.get_process_data()
+                        fresh = platform_adapter.list_processes()
                         await websocket.send(stomp_frame(
                             "SEND",
                             {"destination": "/app/process", "content-type": "application/json"},
@@ -496,11 +431,11 @@ async def run_agent(
 
         except Exception as e:
             print(f"[에이전트] 연결 에러 (5초 후 재시도): {e}")
-            terminal_manager.cleanup_all()
+            platform_adapter.cleanup_terminals()
             await asyncio.sleep(5)
 
 
-def _handle_terminal_command(payload: dict, cmd_type: str, hostname: str) -> None:
+def _handle_terminal_command(payload: dict, cmd_type: str, hostname: str, platform_adapter) -> None:
     """터미널 관련 명령을 분기 처리합니다."""
     if payload.get("nodeName") and payload.get("nodeName") != hostname:
         return
@@ -508,10 +443,10 @@ def _handle_terminal_command(payload: dict, cmd_type: str, hostname: str) -> Non
     session_id = payload.get("sessionId", "")
 
     if cmd_type == "terminal-open":
-        terminal_manager.open_session(session_id, payload.get("cols", 80), payload.get("rows", 24))
+        platform_adapter.open_terminal(session_id, payload.get("cols", 80), payload.get("rows", 24))
     elif cmd_type == "terminal-input":
-        terminal_manager.write(session_id, payload.get("data", ""))
+        platform_adapter.write_terminal(session_id, payload.get("data", ""))
     elif cmd_type == "terminal-resize":
-        terminal_manager.resize(session_id, payload.get("cols", 80), payload.get("rows", 24))
+        platform_adapter.resize_terminal(session_id, payload.get("cols", 80), payload.get("rows", 24))
     elif cmd_type == "terminal-close":
-        terminal_manager.close_session(session_id)
+        platform_adapter.close_terminal(session_id)
