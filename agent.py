@@ -3,6 +3,7 @@
 """
 import asyncio
 import json
+import shlex
 
 import websockets
 from fastapi import HTTPException
@@ -15,7 +16,7 @@ COMMAND_SUBSCRIPTION_ID = "agent-command-channel"
 SYSINFO_SUBSCRIPTION_ID = "sysinfo-request-channel"
 
 
-async def run_agent(url: str, account_token: str, hostname: str, os_type: str, agent_id: str = "") -> None:
+async def run_agent(url: str, account_token: str, hostname: str, os_type: str, agent_id: str = "", service_name: str = "processmanager-agent") -> None:
     """단일 WebSocket 연결로 모니터링·프로세스 전송·kill 명령·터미널을 모두 처리합니다."""
     self_ip = metrics.get_self_ip()
     print(f"[에이전트] STOMP 연결 시도: {url}")
@@ -220,36 +221,51 @@ async def run_agent(url: str, account_token: str, hostname: str, os_type: str, a
                         # ── 업데이트 명령 처리 ──
                         if cmd_type == "update":
                             if payload.get("nodeName") == hostname:
-                                print("[에이전트] 업데이트 명령 수신 → 자가 업데이트 시작")
+                                print("[agent] update command received; starting self-update")
                                 import subprocess, os
                                 agent_dir = os.path.dirname(os.path.abspath(__file__))
+                                # Use the instance-specific systemd service so dev/prod agents do not overwrite each other.
+                                safe_service_name = shlex.quote(service_name)
                                 cmds = ' && '.join([
                                     f'git -C {agent_dir} pull origin master',
                                     f'{agent_dir}/.venv/bin/pip install -r {agent_dir}/requirements.txt -q',
-                                    'sudo systemctl restart processmanager-agent 2>/dev/null || true',
+                                    f'sudo systemctl restart {safe_service_name} 2>/dev/null || true',
                                 ])
                                 subprocess.Popen(['bash', '-c', f'sleep 1 && {cmds}'])
                                 raise SystemExit(0)
                             continue
 
-                        # ── 언인스톨 명령 처리 ──
+                        # Uninstall command handling
                         if cmd_type == "uninstall":
                             if payload.get("nodeName") == hostname:
-                                print("[에이전트] 언인스톨 명령 수신 → 자가 삭제 시작")
+                                print("[agent] uninstall command received; sending ack")
+                                # Send ACK first so the server can remove the node from the UI only after the agent receives the command.
+                                await websocket.send(stomp_frame(
+                                    "SEND",
+                                    {"destination": "/app/agent.uninstall-ack", "content-type": "application/json"},
+                                    json.dumps({
+                                        "nodeName": hostname,
+                                        "serviceName": service_name,
+                                        "stage": "started",
+                                    }),
+                                ))
+                                print("[agent] uninstall ack sent; starting self-removal")
                                 import subprocess, os
                                 agent_dir = os.path.dirname(os.path.abspath(__file__))
+                                safe_service_name = shlex.quote(service_name)
+                                safe_agent_dir = shlex.quote(agent_dir)
                                 cmds = ' && '.join([
-                                    'sudo systemctl disable processmanager-agent 2>/dev/null || true',
-                                    'sudo systemctl stop processmanager-agent 2>/dev/null || true',
-                                    'sudo rm -f /etc/systemd/system/processmanager-agent.service 2>/dev/null || true',
+                                    f'sudo systemctl disable {safe_service_name} 2>/dev/null || true',
+                                    f'sudo systemctl stop {safe_service_name} 2>/dev/null || true',
+                                    f'sudo rm -f /etc/systemd/system/{safe_service_name}.service 2>/dev/null || true',
                                     'sudo systemctl daemon-reload 2>/dev/null || true',
-                                    f'rm -rf {agent_dir}',
+                                    f'rm -rf {safe_agent_dir}',
                                 ])
                                 subprocess.Popen(['bash', '-c', f'sleep 2 && {cmds}'])
                                 raise SystemExit(0)
                             continue
 
-                        # ── 터미널 명령 처리 ──
+                        # Terminal command handling
                         if cmd_type.startswith("terminal-"):
                             _handle_terminal_command(payload, cmd_type, hostname)
                             continue

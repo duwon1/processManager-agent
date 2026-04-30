@@ -31,6 +31,8 @@ class Settings:
     port: int
     reload: bool
     agent_id: str  # 에이전트 고유 UUID (재설치 시 동일 노드 식별)
+    instance: str   # install instance name such as dev/prod
+    service_name: str  # systemd service name controlled during update/uninstall
 
 
 def get_settings() -> Settings:
@@ -54,6 +56,8 @@ def get_settings() -> Settings:
     port           = int(os.getenv("AGENT_PORT", "8888"))
     reload_enabled = os.getenv("LINUX_API_RELOAD", "false").lower() == "true"
     agent_id       = os.getenv("AGENT_ID", "").strip()
+    instance       = os.getenv("INSTANCE", "default").strip()
+    service_name   = os.getenv("SERVICE_NAME", "processmanager-agent").strip()
 
     return Settings(
         websocket_url=websocket_url,
@@ -63,4 +67,6 @@ def get_settings() -> Settings:
         port=port,
         reload=reload_enabled,
         agent_id=agent_id,
+        instance=instance,
+        service_name=service_name,
     )
