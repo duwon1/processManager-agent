@@ -3,7 +3,9 @@
 """
 import asyncio
 import json
+import os
 import shlex
+import subprocess
 
 import websockets
 from fastapi import HTTPException
@@ -14,6 +16,30 @@ from system import metrics, process, hardware, services
 
 COMMAND_SUBSCRIPTION_ID = "agent-command-channel"
 SYSINFO_SUBSCRIPTION_ID = "sysinfo-request-channel"
+
+
+def get_git_revisions(agent_dir: str) -> tuple[str, str, str]:
+    """로컬/원격 Git 커밋을 조회해 업데이트 필요 여부 판단에 사용합니다."""
+    try:
+        current_sha = subprocess.check_output(
+            ["git", "-C", agent_dir, "rev-parse", "HEAD"],
+            text=True,
+            timeout=5,
+        ).strip()[:7]
+    except Exception as exc:
+        current_sha = "unknown"
+        return current_sha, current_sha, str(exc)
+
+    try:
+        result = subprocess.check_output(
+            ["git", "-C", agent_dir, "ls-remote", "origin", "HEAD"],
+            text=True,
+            timeout=10,
+        )
+        latest_sha = result.split()[0][:7] if result.strip() else current_sha
+        return current_sha, latest_sha, ""
+    except Exception as exc:
+        return current_sha, current_sha, str(exc)
 
 
 async def run_agent(
@@ -90,6 +116,27 @@ async def run_agent(
                         json.dumps({"nodeName": hostname, "agentId": agent_id}),
                     ))
 
+                async def report_update_result(stage: str, success: bool | None = None, message: str = ""):
+                    """업데이트 명령 ACK와 재연결 후 최신 커밋 확인 결과를 서버에 보고합니다."""
+                    agent_dir = os.path.dirname(os.path.abspath(__file__))
+                    current_sha, latest_sha, error = get_git_revisions(agent_dir)
+                    resolved_success = (not error and current_sha == latest_sha) if success is None else success
+                    await websocket.send(stomp_frame(
+                        "SEND",
+                        {"destination": "/app/agent.update-result", "content-type": "application/json"},
+                        json.dumps({
+                            "nodeName": hostname,
+                            "agentId": agent_id,
+                            "stage": stage,
+                            "success": resolved_success,
+                            "currentSha": current_sha,
+                            "latestSha": latest_sha,
+                            "message": message or error,
+                        }),
+                    ))
+
+                await report_update_result("checked")
+
                 async def send_monitoring_loop():
                     """시스템 메트릭을 2초 간격으로 전송합니다."""
                     while True:
@@ -150,36 +197,31 @@ async def run_agent(
 
                 async def check_update_loop():
                     """60초마다 GitHub 최신 커밋을 확인하고 업데이트 가능 시 알립니다."""
-                    import subprocess, os
                     agent_dir = os.path.dirname(os.path.abspath(__file__))
-                    try:
-                        current_sha = subprocess.check_output(
-                            ['git', '-C', agent_dir, 'rev-parse', 'HEAD'],
-                            text=True, timeout=5
-                        ).strip()[:7]
-                    except Exception:
-                        current_sha = 'unknown'
+                    last_reported_latest = ""
                     while True:
                         await asyncio.sleep(60)
-                        try:
-                            result = subprocess.check_output(
-                                ['git', '-C', agent_dir, 'ls-remote', 'origin', 'HEAD'],
-                                text=True, timeout=10
-                            )
-                            latest_sha = result.split()[0][:7] if result.strip() else current_sha
-                            if latest_sha != current_sha:
-                                await websocket.send(stomp_frame(
-                                    "SEND",
-                                    {"destination": "/app/agent.update-available", "content-type": "application/json"},
-                                    __import__('json').dumps({
-                                        "nodeName": hostname,
-                                        "currentSha": current_sha,
-                                        "latestSha": latest_sha,
-                                    }),
-                                ))
-                                print(f"[에이전트] 업데이트 가능: {current_sha} → {latest_sha}")
-                        except Exception as e:
-                            print(f"[에이전트] 업데이트 확인 오류: {e}")
+                        current_sha, latest_sha, error = get_git_revisions(agent_dir)
+                        if error:
+                            print(f"[에이전트] 업데이트 확인 오류: {error}")
+                            continue
+                        if latest_sha == current_sha:
+                            last_reported_latest = ""
+                            continue
+                        if latest_sha == last_reported_latest:
+                            continue
+                        await websocket.send(stomp_frame(
+                            "SEND",
+                            {"destination": "/app/agent.update-available", "content-type": "application/json"},
+                            json.dumps({
+                                "nodeName": hostname,
+                                "agentId": agent_id,
+                                "currentSha": current_sha,
+                                "latestSha": latest_sha,
+                            }),
+                        ))
+                        last_reported_latest = latest_sha
+                        print(f"[에이전트] 업데이트 가능: {current_sha} → {latest_sha}")
 
                 async def receive_commands_loop():
                     """백엔드에서 오는 명령(kill·터미널·시스템 정보·서비스 제어)을 수신하고 처리합니다."""
@@ -338,19 +380,27 @@ async def run_agent(
 
                         # ── 업데이트 명령 처리 ──
                         if cmd_type == "update":
-                            if payload.get("nodeName") == hostname:
-                                print("[agent] update command received; starting self-update")
-                                import subprocess, os
-                                agent_dir = os.path.dirname(os.path.abspath(__file__))
-                                # Use the instance-specific systemd service so dev/prod agents do not overwrite each other.
-                                safe_service_name = shlex.quote(service_name)
-                                cmds = ' && '.join([
-                                    f'git -C {agent_dir} pull origin master',
-                                    f'{agent_dir}/.venv/bin/pip install -r {agent_dir}/requirements.txt -q',
-                                    f'sudo systemctl restart {safe_service_name} 2>/dev/null || true',
-                                ])
-                                subprocess.Popen(['bash', '-c', f'sleep 1 && {cmds}'])
-                                raise SystemExit(0)
+                            target_agent_id = str(payload.get("agentId", "") or "").strip()
+                            target_node_name = str(payload.get("nodeName", "") or "").strip()
+                            if target_agent_id:
+                                if target_agent_id != agent_id:
+                                    continue
+                            elif target_node_name != hostname:
+                                continue
+
+                            print("[agent] update command received; starting self-update")
+                            await report_update_result("started", True, "업데이트 명령 수신")
+                            agent_dir = os.path.dirname(os.path.abspath(__file__))
+                            # 인스턴스별 service_name과 agent_dir를 사용해 개발/운영 에이전트가 서로 덮어쓰지 않게 합니다.
+                            safe_service_name = shlex.quote(service_name)
+                            safe_agent_dir = shlex.quote(agent_dir)
+                            cmds = ' && '.join([
+                                f'git -C {safe_agent_dir} pull origin master',
+                                f'{safe_agent_dir}/.venv/bin/pip install -r {safe_agent_dir}/requirements.txt -q',
+                                f'sudo systemctl restart {safe_service_name} 2>/dev/null || true',
+                            ])
+                            subprocess.Popen(['bash', '-c', f'sleep 1 && {cmds}'])
+                            raise SystemExit(0)
                             continue
 
                         # Uninstall command handling
