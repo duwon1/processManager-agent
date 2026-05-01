@@ -271,7 +271,6 @@ async def run_agent(
                                 new_secret = str(payload.get("agentSecret", "")).strip()
                                 if new_secret:
                                     # 서버가 발급한 노드 전용 secret을 .env에 저장해 다음 재접속부터 account-token을 쓰지 않습니다.
-                                    import os
                                     env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
                                     lines = []
                                     found = False
@@ -348,15 +347,27 @@ async def run_agent(
                                 continue
 
                             print("[agent] update command received; starting self-update")
-                            await report_update_result("started", True, "업데이트 명령 수신")
-                            agent_dir = os.path.dirname(os.path.abspath(__file__))
-                            update_success, update_message = await platform_adapter.self_update(agent_dir)
-                            if not update_success:
-                                await report_update_result("failed", False, update_message[-400:])
+                            try:
+                                # 업데이트 경로 전체를 감싸 예외가 나도 서버와 브라우저에 실패 결과를 보고합니다.
+                                await report_update_result("started", True, "업데이트 명령 수신")
+                                agent_dir = os.path.dirname(os.path.abspath(__file__))
+                                update_success, update_message = await platform_adapter.self_update(agent_dir)
+                                if not update_success:
+                                    await report_update_result("failed", False, update_message[-400:])
+                                    print(f"[agent] update failed: {update_message}")
+                                    continue
+                                await report_update_result("pulled", True, "업데이트 적용 후 재시작")
+                                raise SystemExit(0)
+                            except SystemExit:
+                                raise
+                            except Exception as e:
+                                update_message = str(e)
+                                try:
+                                    await report_update_result("failed", False, update_message[-400:])
+                                except Exception as report_error:
+                                    print(f"[agent] update failure report failed: {report_error}")
                                 print(f"[agent] update failed: {update_message}")
                                 continue
-                            await report_update_result("pulled", True, "업데이트 적용 후 재시작")
-                            raise SystemExit(0)
                             continue
 
                         # Uninstall command handling
