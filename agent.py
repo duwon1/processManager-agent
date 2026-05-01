@@ -348,7 +348,7 @@ async def run_agent(
 
                             print("[agent] update command received; starting self-update")
                             try:
-                                # 업데이트 경로 전체를 감싸 예외가 나도 서버와 브라우저에 실패 결과를 보고합니다.
+                                # 업데이트 경로 전체를 감싸 예외가 나도 서버와 브라우저에 실패 결과를 보고합니다. (업데이트 감지 테스트용)
                                 await report_update_result("started", True, "업데이트 명령 수신")
                                 agent_dir = os.path.dirname(os.path.abspath(__file__))
                                 update_success, update_message = await platform_adapter.self_update(agent_dir)
