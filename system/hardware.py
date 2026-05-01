@@ -31,6 +31,51 @@ def _parse_first_int(value: str | None) -> int | None:
     return int(match.group(0)) if match else None
 
 
+def _read_int_file(path: str) -> int | None:
+    """숫자만 담긴 sysfs 파일을 int로 읽습니다. 없거나 권한이 없으면 값을 보내지 않습니다."""
+    try:
+        with open(path, encoding="utf-8") as f:
+            raw = f.read().strip()
+        return int(raw, 16) if raw.lower().startswith("0x") else int(raw)
+    except Exception:
+        return None
+
+
+def _drm_card_device_dirs() -> list[str]:
+    """DRM card 장치 디렉토리를 card 번호 순서대로 반환합니다."""
+    try:
+        cards = sorted(
+            c for c in os.listdir("/sys/class/drm/")
+            if re.match(r"^card\d+$", c)
+        )
+    except Exception:
+        return []
+
+    device_dirs = []
+    for card in cards:
+        device_dir = f"/sys/class/drm/{card}/device"
+        if os.path.isdir(device_dir):
+            device_dirs.append(device_dir)
+    return device_dirs
+
+
+def _apply_drm_memory_info(entry: dict, device_dir: str) -> None:
+    """DRM sysfs가 제공하는 전용/공유 GPU 메모리 정보를 entry에 추가합니다."""
+    vram_total = _read_int_file(os.path.join(device_dir, "mem_info_vram_total"))
+    vram_used = _read_int_file(os.path.join(device_dir, "mem_info_vram_used"))
+    gtt_total = _read_int_file(os.path.join(device_dir, "mem_info_gtt_total"))
+    gtt_used = _read_int_file(os.path.join(device_dir, "mem_info_gtt_used"))
+
+    if vram_total is not None:
+        entry["dedicatedMemoryBytes"] = vram_total
+    if vram_used is not None:
+        entry["usedMemoryBytes"] = vram_used
+    if gtt_total is not None:
+        entry["sharedMemoryBytes"] = gtt_total
+    if "usedMemoryBytes" not in entry and gtt_used is not None:
+        entry["usedMemoryBytes"] = gtt_used
+
+
 def _cache_size_bytes(level: int) -> int | None:
     """Linux sysfs 캐시 크기(K/M/G suffix)를 bytes 숫자로 정규화합니다."""
     try:
@@ -318,24 +363,14 @@ def _collect_gpus() -> list:
             return results
 
     lspci_models = _lspci_gpus()
-    mem = psutil.virtual_memory()
+    drm_device_dirs = _drm_card_device_dirs()
     kernel = _run(["uname", "-r"])
 
     for i, model in enumerate(lspci_models):
         entry = {"model": model}
 
-        try:
-            cards = sorted(c for c in os.listdir("/sys/class/drm/") if re.match(r"^card\d+$", c))
-            if i < len(cards):
-                vram_path = f"/sys/class/drm/{cards[i]}/device/mem_info_vram_total"
-                if os.path.exists(vram_path):
-                    with open(vram_path, encoding="utf-8") as f:
-                        entry["dedicatedMemoryBytes"] = int(f.read().strip())
-        except Exception:
-            pass
-
-        if "dedicatedMemoryBytes" not in entry:
-            entry["sharedMemoryBytes"] = mem.total
+        if i < len(drm_device_dirs):
+            _apply_drm_memory_info(entry, drm_device_dirs[i])
         if kernel:
             entry["driverVersion"] = kernel
 
