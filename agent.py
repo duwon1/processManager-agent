@@ -18,7 +18,7 @@ UPDATE_CHECK_INTERVAL_SECONDS = 10 * 60
 
 
 def get_git_revisions(agent_dir: str) -> tuple[str, str, str]:
-    """로컬/원격 Git 커밋을 조회해 업데이트 필요 여부 판단에 사용합니다."""
+    """로컬/원격 Git 커밋을 조회해 에이전트 업데이트 필요 여부 판단에 사용합니다."""
     try:
         current_sha = subprocess.check_output(
             ["git", "-C", agent_dir, "rev-parse", "HEAD"],
