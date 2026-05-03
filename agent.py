@@ -14,6 +14,7 @@ from stomp import stomp_frame, extract_stomp_body, extract_stomp_destination
 
 COMMAND_SUBSCRIPTION_ID = "agent-command-channel"
 SYSINFO_SUBSCRIPTION_ID = "sysinfo-request-channel"
+UPDATE_CHECK_INTERVAL_SECONDS = 10 * 60
 
 
 def get_git_revisions(agent_dir: str) -> tuple[str, str, str]:
@@ -53,6 +54,7 @@ async def run_agent(
     # 서버 통신은 공통으로 유지하고, OS 의존 기능은 adapter를 통해 실행합니다.
     platform_adapter = get_platform_adapter(os_type)
     self_ip = platform_adapter.get_self_ip()
+    update_lock = asyncio.Lock()
     print(f"[에이전트] STOMP 연결 시도: {url}")
 
     while True:
@@ -85,7 +87,7 @@ async def run_agent(
                     "SUBSCRIBE",
                     {
                         "id": COMMAND_SUBSCRIPTION_ID,
-                        "destination": "/topic/agent.command",
+                        "destination": f"/topic/agent.command.{agent_id}",
                         "ack": "auto",
                     },
                 ))
@@ -105,7 +107,7 @@ async def run_agent(
                     "SUBSCRIBE",
                     {
                         "id": SYSINFO_SUBSCRIPTION_ID,
-                        "destination": "/topic/agent.sysinfo-request",
+                        "destination": f"/topic/agent.sysinfo-request.{agent_id}",
                         "ack": "auto",
                     },
                 ))
@@ -138,7 +140,45 @@ async def run_agent(
                         }),
                     ))
 
-                await report_update_result("checked")
+                async def report_update_available(current_sha: str, latest_sha: str) -> None:
+                    await websocket.send(stomp_frame(
+                        "SEND",
+                        {"destination": "/app/agent.update-available", "content-type": "application/json"},
+                        json.dumps({
+                            "nodeName": hostname,
+                            "agentId": agent_id,
+                            "currentSha": current_sha,
+                            "latestSha": latest_sha,
+                        }),
+                    ))
+
+                async def check_and_apply_update(reason: str) -> None:
+                    """GitHub 최신 커밋을 확인하고, 새 버전이 있으면 직접 업데이트 후 재시작합니다."""
+                    async with update_lock:
+                        agent_dir = os.path.dirname(os.path.abspath(__file__))
+                        current_sha, latest_sha, error = get_git_revisions(agent_dir)
+                        if error:
+                            print(f"[에이전트] 업데이트 확인 오류: {error}")
+                            await report_update_result("check-failed", False, error[-400:])
+                            return
+
+                        if latest_sha == current_sha:
+                            await report_update_result("checked", True, f"{reason}: 최신 상태")
+                            return
+
+                        print(f"[에이전트] 업데이트 감지({reason}): {current_sha} → {latest_sha}")
+                        await report_update_available(current_sha, latest_sha)
+                        await report_update_result("started", True, f"{reason}: 업데이트 시작")
+
+                        update_success, update_message = await platform_adapter.self_update(agent_dir)
+                        if not update_success:
+                            await report_update_result("failed", False, update_message[-400:])
+                            print(f"[에이전트] 업데이트 실패: {update_message}")
+                            return
+
+                        await report_update_result("pulled", True, (update_message or "업데이트 적용 후 재시작")[-400:])
+                        print("[에이전트] 업데이트 적용 완료; 재시작합니다.")
+                        raise SystemExit(0)
 
                 async def send_monitoring_loop():
                     """시스템 메트릭을 2초 간격으로 전송합니다."""
@@ -199,32 +239,11 @@ async def run_agent(
                         await asyncio.sleep(0.05)
 
                 async def check_update_loop():
-                    """60초마다 GitHub 최신 커밋을 확인하고 업데이트 가능 시 알립니다."""
-                    agent_dir = os.path.dirname(os.path.abspath(__file__))
-                    last_reported_latest = ""
+                    """시작 시 1회, 이후 10분마다 GitHub 최신 커밋을 확인하고 필요하면 업데이트합니다."""
+                    await check_and_apply_update("startup")
                     while True:
-                        await asyncio.sleep(60)
-                        current_sha, latest_sha, error = get_git_revisions(agent_dir)
-                        if error:
-                            print(f"[에이전트] 업데이트 확인 오류: {error}")
-                            continue
-                        if latest_sha == current_sha:
-                            last_reported_latest = ""
-                            continue
-                        if latest_sha == last_reported_latest:
-                            continue
-                        await websocket.send(stomp_frame(
-                            "SEND",
-                            {"destination": "/app/agent.update-available", "content-type": "application/json"},
-                            json.dumps({
-                                "nodeName": hostname,
-                                "agentId": agent_id,
-                                "currentSha": current_sha,
-                                "latestSha": latest_sha,
-                            }),
-                        ))
-                        last_reported_latest = latest_sha
-                        print(f"[에이전트] 업데이트 가능: {current_sha} → {latest_sha}")
+                        await asyncio.sleep(UPDATE_CHECK_INTERVAL_SECONDS)
+                        await check_and_apply_update("scheduled")
 
                 async def receive_commands_loop():
                     """백엔드에서 오는 명령(kill·터미널·시스템 정보·서비스 제어)을 수신하고 처리합니다."""
@@ -248,7 +267,7 @@ async def run_agent(
                         destination = extract_stomp_destination(frame_text)
 
                         # ── 시스템 정보 수집 요청 ──
-                        if destination == "/topic/agent.sysinfo-request":
+                        if destination == f"/topic/agent.sysinfo-request.{agent_id}":
                             if payload.get("nodeName") == hostname:
                                 try:
                                     loop = asyncio.get_event_loop()
@@ -337,7 +356,7 @@ async def run_agent(
                             continue
 
                         # ── 업데이트 명령 처리 ──
-                        if cmd_type == "update":
+                        if cmd_type in ("update", "update-check"):
                             target_agent_id = str(payload.get("agentId", "") or "").strip()
                             target_node_name = str(payload.get("nodeName", "") or "").strip()
                             if target_agent_id:
@@ -346,18 +365,9 @@ async def run_agent(
                             elif target_node_name != hostname:
                                 continue
 
-                            print("[agent] update command received; starting self-update")
+                            print("[agent] update check command received")
                             try:
-                                # 업데이트 경로 전체를 감싸 예외가 나도 서버와 브라우저에 실패 결과를 보고합니다. (업데이트 감지 테스트용)
-                                await report_update_result("started", True, "업데이트 명령 수신")
-                                agent_dir = os.path.dirname(os.path.abspath(__file__))
-                                update_success, update_message = await platform_adapter.self_update(agent_dir)
-                                if not update_success:
-                                    await report_update_result("failed", False, update_message[-400:])
-                                    print(f"[agent] update failed: {update_message}")
-                                    continue
-                                await report_update_result("pulled", True, "업데이트 적용 후 재시작")
-                                raise SystemExit(0)
+                                await check_and_apply_update("manual")
                             except SystemExit:
                                 raise
                             except Exception as e:
