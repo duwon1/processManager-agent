@@ -11,7 +11,7 @@ async def self_update(agent_dir: str) -> tuple[bool, str]:
     safe_agent_dir = shlex.quote(agent_dir)
     cmds = " && ".join([
         f"git -C {safe_agent_dir} pull origin master",
-        f"{safe_agent_dir}/.venv/bin/pip install -r {safe_agent_dir}/requirements.txt -q",
+        f"{safe_agent_dir}/.venv/bin/python -m pip install -r {safe_agent_dir}/requirements.txt -q",
     ])
     result = await asyncio.to_thread(
         subprocess.run,
