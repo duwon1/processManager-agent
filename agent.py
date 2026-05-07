@@ -156,6 +156,14 @@ async def run_agent(
                     """GitHub 최신 커밋을 확인하고, 새 버전이 있으면 직접 업데이트 후 재시작합니다."""
                     async with update_lock:
                         agent_dir = os.path.dirname(os.path.abspath(__file__))
+                        ensure_runtime_security = getattr(platform_adapter, "ensure_runtime_security", None)
+                        if callable(ensure_runtime_security):
+                            security_success, security_message = await ensure_runtime_security(agent_dir, service_name)
+                            if security_success:
+                                print(f"[agent] runtime security checked: {security_message}")
+                            else:
+                                print(f"[agent] runtime security hardening failed: {security_message}")
+
                         current_sha, latest_sha, error = get_git_revisions(agent_dir)
                         if error:
                             print(f"[에이전트] 업데이트 확인 오류: {error}")

@@ -4,7 +4,7 @@ from __future__ import annotations
 from typing import Any
 
 from pm_agent.platforms.base import PlatformAdapter
-from pm_agent.platforms.linux import filesystem, hardware, metrics, processes, services, terminal, updater, uninstaller
+from pm_agent.platforms.linux import filesystem, hardware, metrics, processes, security, services, terminal, updater, uninstaller
 from pm_agent.platforms.linux.capabilities import LINUX_CAPABILITIES
 
 
@@ -58,6 +58,9 @@ class LinuxAdapter(PlatformAdapter):
 
     async def self_update(self, agent_dir: str) -> tuple[bool, str]:
         return await updater.self_update(agent_dir)
+
+    async def ensure_runtime_security(self, agent_dir: str, service_name: str) -> tuple[bool, str]:
+        return await security.ensure_limited_sudoers(agent_dir, service_name)
 
     def start_self_uninstall(self, agent_dir: str, service_name: str) -> None:
         uninstaller.start_self_uninstall(agent_dir, service_name)
