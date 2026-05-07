@@ -19,6 +19,7 @@ SERVICE_NAME_RE = re.compile(r"^[A-Za-z0-9_.@-]+$")
 USER_NAME_RE = re.compile(r"^[A-Za-z0-9_.@-]+$")
 BASE_SERVICE_NAME = "processmanager-agent"
 BASE_SUDOERS_PATH = "/etc/sudoers.d/processmanager"
+HARDENING_MARKER = ".sudoers_hardening_checked"
 
 
 async def ensure_limited_sudoers(agent_dir: str, service_name: str) -> tuple[bool, str]:
@@ -41,6 +42,10 @@ async def ensure_limited_sudoers(agent_dir: str, service_name: str) -> tuple[boo
         return False, f"invalid agent user: {agent_user!r}"
 
     sudoers_path = resolve_sudoers_path(service_name)
+    marker_path = Path(agent_dir) / HARDENING_MARKER
+    if marker_path.exists():
+        return True, "sudoers hardening skipped: already checked"
+
     desired = build_limited_sudoers(agent_user, service_name, systemctl_bin, rm_bin)
 
     temp_path = ""
@@ -53,15 +58,18 @@ async def ensure_limited_sudoers(agent_dir: str, service_name: str) -> tuple[boo
         validation = run_sudo([visudo_bin, "-cf", temp_path])
         if validation.returncode != 0:
             if sudo_denied(validation):
+                write_marker(marker_path, "sudo already restricted")
                 return True, "sudoers hardening skipped: sudo is already restricted"
             return False, clean_output(validation) or "sudoers validation failed"
 
         installed = run_sudo([install_bin, "-m", "0440", "-o", "root", "-g", "root", temp_path, sudoers_path])
         if installed.returncode != 0:
             if sudo_denied(installed):
+                write_marker(marker_path, "sudo already restricted")
                 return True, "sudoers hardening skipped: sudo is already restricted"
             return False, clean_output(installed) or "sudoers install failed"
 
+        write_marker(marker_path, f"installed {sudoers_path}")
         return True, f"sudoers hardened: {sudoers_path}"
     finally:
         if temp_path:
@@ -99,6 +107,13 @@ def build_limited_sudoers(agent_user: str, service_name: str, systemctl_bin: str
         f"{agent_user} ALL=(root) NOPASSWD: {rm_bin} -f {service_file}",
         "",
     ])
+
+
+def write_marker(marker_path: Path, message: str) -> None:
+    try:
+        marker_path.write_text(message + "\n", encoding="utf-8")
+    except OSError:
+        pass
 
 
 def run_sudo(args: list[str]) -> subprocess.CompletedProcess[str]:
