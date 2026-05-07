@@ -2,6 +2,7 @@
 import glob
 import os
 import re
+import shutil
 import socket
 import subprocess
 import time
@@ -121,14 +122,14 @@ def _get_memory_hardware() -> dict[str, Any] | None:
     global _memory_hardware_cache, _memory_hardware_loaded
     if _memory_hardware_loaded:
         return _memory_hardware_cache
-    if hasattr(os, "geteuid") and os.geteuid() != 0:
-        _memory_hardware_cache = None
-        _memory_hardware_loaded = True
-        return None
 
     try:
+        dmidecode_bin = shutil.which("dmidecode") or "/usr/sbin/dmidecode"
+        cmd = [dmidecode_bin, "-t", "17"]
+        if hasattr(os, "geteuid") and os.geteuid() != 0:
+            cmd = ["sudo", "-n", *cmd]
         output = subprocess.check_output(
-            ["dmidecode", "-t", "17"],
+            cmd,
             stderr=subprocess.DEVNULL,
             text=True,
             timeout=5,

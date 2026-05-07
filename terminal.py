@@ -5,6 +5,7 @@ import asyncio
 import fcntl
 import os
 import pty
+import pwd
 import select
 import signal
 import struct
@@ -32,9 +33,18 @@ class TerminalManager:
             # 자식 프로세스: 홈 디렉터리에서 쉘 실행
             os.environ['TERM'] = 'xterm-256color'
             os.environ['LANG'] = 'ko_KR.UTF-8'
-            shell = os.environ.get('SHELL', '/bin/bash')
-            os.chdir(os.path.expanduser('~'))
-            os.execvp(shell, [shell, '--login'])
+            shell = os.environ.get('TERMINAL_SHELL') or os.environ.get('SHELL', '/bin/bash')
+            terminal_user = os.environ.get('TERMINAL_USER', '').strip()
+            if terminal_user:
+                try:
+                    target_home = pwd.getpwnam(terminal_user).pw_dir
+                    os.chdir(target_home)
+                except Exception:
+                    os.chdir("/")
+                os.execvp("sudo", ["sudo", "-H", "-n", "-u", terminal_user, shell, "--login"])
+            else:
+                os.chdir(os.path.expanduser('~'))
+                os.execvp(shell, [shell, '--login'])
         else:
             # 부모 프로세스: PTY 크기 설정 및 읽기 스레드 시작
             try:

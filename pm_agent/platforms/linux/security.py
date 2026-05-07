@@ -17,9 +17,11 @@ except ImportError:  # pragma: no cover - Linux runtime provides pwd.
 
 SERVICE_NAME_RE = re.compile(r"^[A-Za-z0-9_.@-]+$")
 USER_NAME_RE = re.compile(r"^[A-Za-z0-9_.@-]+$")
+ABS_PATH_RE = re.compile(r"^/[A-Za-z0-9_./@+-]+$")
 BASE_SERVICE_NAME = "processmanager-agent"
 BASE_SUDOERS_PATH = "/etc/sudoers.d/processmanager"
 HARDENING_MARKER = ".sudoers_hardening_checked"
+HARDENING_MARKER_VERSION = "limited-sudoers-v3"
 
 
 async def ensure_limited_sudoers(agent_dir: str, service_name: str) -> tuple[bool, str]:
@@ -35,18 +37,28 @@ async def ensure_limited_sudoers(agent_dir: str, service_name: str) -> tuple[boo
 
     systemctl_bin = shutil.which("systemctl") or "/usr/bin/systemctl"
     rm_bin = shutil.which("rm") or "/usr/bin/rm"
+    dmidecode_bin = shutil.which("dmidecode") or "/usr/sbin/dmidecode"
+    terminal_shell = os.getenv("TERMINAL_SHELL", "").strip() or shutil.which("bash") or "/bin/bash"
     visudo_bin = shutil.which("visudo") or "/usr/sbin/visudo"
     install_bin = shutil.which("install") or "/usr/bin/install"
     agent_user = resolve_agent_user(agent_dir)
     if not USER_NAME_RE.fullmatch(agent_user):
         return False, f"invalid agent user: {agent_user!r}"
+    terminal_user = os.getenv("TERMINAL_USER", "").strip()
+    if terminal_user and not USER_NAME_RE.fullmatch(terminal_user):
+        return False, f"invalid terminal user: {terminal_user!r}"
+    if not ABS_PATH_RE.fullmatch(dmidecode_bin) or not ABS_PATH_RE.fullmatch(terminal_shell):
+        return False, "invalid privileged command path"
 
     sudoers_path = resolve_sudoers_path(service_name)
     marker_path = Path(agent_dir) / HARDENING_MARKER
-    if marker_path.exists():
+    if marker_is_current(marker_path):
         return True, "sudoers hardening skipped: already checked"
 
-    desired = build_limited_sudoers(agent_user, service_name, systemctl_bin, rm_bin)
+    desired = build_limited_sudoers(
+        agent_user, service_name, systemctl_bin, rm_bin,
+        dmidecode_bin, terminal_user, terminal_shell,
+    )
 
     temp_path = ""
     try:
@@ -97,21 +109,42 @@ def resolve_sudoers_path(service_name: str) -> str:
     return BASE_SUDOERS_PATH
 
 
-def build_limited_sudoers(agent_user: str, service_name: str, systemctl_bin: str, rm_bin: str) -> str:
+def build_limited_sudoers(
+    agent_user: str,
+    service_name: str,
+    systemctl_bin: str,
+    rm_bin: str,
+    dmidecode_bin: str,
+    terminal_user: str,
+    terminal_shell: str,
+) -> str:
     service_file = f"/etc/systemd/system/{service_name}.service"
-    return "\n".join([
+    lines = [
         f"{agent_user} ALL=(root) NOPASSWD: {systemctl_bin} restart {service_name}",
         f"{agent_user} ALL=(root) NOPASSWD: {systemctl_bin} stop {service_name}",
         f"{agent_user} ALL=(root) NOPASSWD: {systemctl_bin} disable {service_name}",
         f"{agent_user} ALL=(root) NOPASSWD: {systemctl_bin} daemon-reload",
         f"{agent_user} ALL=(root) NOPASSWD: {rm_bin} -f {service_file}",
-        "",
-    ])
+        f"{agent_user} ALL=(root) NOPASSWD: {dmidecode_bin} -t memory",
+        f"{agent_user} ALL=(root) NOPASSWD: {dmidecode_bin} -t 17",
+    ]
+    if terminal_user and terminal_user != agent_user:
+        lines.append(f"{agent_user} ALL=({terminal_user}) NOPASSWD: {terminal_shell} --login")
+    lines.append("")
+    return "\n".join(lines)
+
+
+def marker_is_current(marker_path: Path) -> bool:
+    try:
+        first_line = marker_path.read_text(encoding="utf-8").splitlines()[0]
+        return first_line == HARDENING_MARKER_VERSION
+    except (OSError, IndexError):
+        return False
 
 
 def write_marker(marker_path: Path, message: str) -> None:
     try:
-        marker_path.write_text(message + "\n", encoding="utf-8")
+        marker_path.write_text(HARDENING_MARKER_VERSION + "\n" + message + "\n", encoding="utf-8")
     except OSError:
         pass
 

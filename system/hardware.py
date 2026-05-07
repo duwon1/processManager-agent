@@ -5,6 +5,7 @@
 
 import os
 import re
+import shutil
 import socket
 import subprocess
 import time
@@ -23,10 +24,10 @@ def _run(cmd, timeout=3) -> str:
         return ""
 
 
-def _run_root_only(cmd, timeout=3) -> str:
-    """root 권한에서만 실행해야 하는 명령은 비root 에이전트에서 건너뜁니다."""
+def _run_privileged(cmd, timeout=3) -> str:
+    """root 필요 명령은 root면 직접, 아니면 제한된 sudo로 실행합니다."""
     if hasattr(os, "geteuid") and os.geteuid() != 0:
-        return ""
+        cmd = ["sudo", "-n", *cmd]
     return _run(cmd, timeout=timeout)
 
 
@@ -157,7 +158,8 @@ def _collect_cpu() -> dict:
 def _dmidecode_memory() -> dict:
     """dmidecode 메모리 정보를 구조화된 숫자 필드로 반환합니다."""
     result = {}
-    out = _run_root_only(["dmidecode", "-t", "memory"], timeout=5)
+    dmidecode_bin = shutil.which("dmidecode") or "/usr/sbin/dmidecode"
+    out = _run_privileged([dmidecode_bin, "-t", "memory"], timeout=5)
     if not out:
         return result
 
