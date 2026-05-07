@@ -1,5 +1,6 @@
 """시스템 메트릭(CPU·GPU·메모리·디스크·네트워크·하드웨어)을 표준 단위로 수집합니다."""
 import glob
+import os
 import re
 import socket
 import subprocess
@@ -120,10 +121,14 @@ def _get_memory_hardware() -> dict[str, Any] | None:
     global _memory_hardware_cache, _memory_hardware_loaded
     if _memory_hardware_loaded:
         return _memory_hardware_cache
+    if hasattr(os, "geteuid") and os.geteuid() != 0:
+        _memory_hardware_cache = None
+        _memory_hardware_loaded = True
+        return None
 
     try:
         output = subprocess.check_output(
-            ["sudo", "dmidecode", "-t", "17"],
+            ["dmidecode", "-t", "17"],
             stderr=subprocess.DEVNULL,
             text=True,
             timeout=5,

@@ -23,6 +23,13 @@ def _run(cmd, timeout=3) -> str:
         return ""
 
 
+def _run_root_only(cmd, timeout=3) -> str:
+    """root 권한에서만 실행해야 하는 명령은 비root 에이전트에서 건너뜁니다."""
+    if hasattr(os, "geteuid") and os.geteuid() != 0:
+        return ""
+    return _run(cmd, timeout=timeout)
+
+
 def _parse_first_int(value: str | None) -> int | None:
     """OS 명령 출력에서 첫 번째 정수를 추출합니다."""
     if not value:
@@ -150,7 +157,7 @@ def _collect_cpu() -> dict:
 def _dmidecode_memory() -> dict:
     """dmidecode 메모리 정보를 구조화된 숫자 필드로 반환합니다."""
     result = {}
-    out = _run(["sudo", "dmidecode", "-t", "memory"], timeout=5)
+    out = _run_root_only(["dmidecode", "-t", "memory"], timeout=5)
     if not out:
         return result
 
