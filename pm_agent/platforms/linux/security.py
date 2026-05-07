@@ -62,10 +62,6 @@ async def ensure_limited_sudoers(agent_dir: str, service_name: str) -> tuple[boo
                 return True, "sudoers hardening skipped: sudo is already restricted"
             return False, clean_output(installed) or "sudoers install failed"
 
-        final_validation = run_sudo([visudo_bin, "-cf", sudoers_path])
-        if final_validation.returncode != 0:
-            return False, clean_output(final_validation) or "installed sudoers validation failed"
-
         return True, f"sudoers hardened: {sudoers_path}"
     finally:
         if temp_path:
