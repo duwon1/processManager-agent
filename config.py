@@ -39,7 +39,7 @@ class Settings:
 
 def get_settings() -> Settings:
     """환경변수와 기본값을 합쳐 Settings 인스턴스를 반환합니다.
-    ACCOUNT_TOKEN, SPRING_WS_URL이 없으면 즉시 RuntimeError를 발생시킵니다.
+    SPRING_WS_URL이 없거나, ACCOUNT_TOKEN/AGENT_SECRET이 모두 없으면 즉시 RuntimeError를 발생시킵니다.
     """
     load_env_file()
 
@@ -48,17 +48,16 @@ def get_settings() -> Settings:
     if not websocket_url:
         raise RuntimeError("SPRING_WS_URL이 없습니다. .env 파일에 설정해주세요.")
 
-    # ACCOUNT_TOKEN은 설치 시 반드시 주입해야 합니다.
     account_token = os.getenv("ACCOUNT_TOKEN", "").strip()
-    if not account_token:
-        raise RuntimeError("ACCOUNT_TOKEN이 없습니다. 설치 시 토큰을 주입해주세요.")
+    agent_secret   = os.getenv("AGENT_SECRET", "").strip()
+    if not account_token and not agent_secret:
+        raise RuntimeError("ACCOUNT_TOKEN 또는 AGENT_SECRET이 필요합니다.")
 
     hostname       = os.getenv("HOSTNAME", socket.gethostname() or "Linux-Server")
     os_type        = os.getenv("OS_TYPE", py_platform.system() or "Linux")
     port           = int(os.getenv("AGENT_PORT", "8888"))
     reload_enabled = os.getenv("LINUX_API_RELOAD", "false").lower() == "true"
     agent_id       = os.getenv("AGENT_ID", "").strip()
-    agent_secret   = os.getenv("AGENT_SECRET", "").strip()
     instance       = os.getenv("INSTANCE", "default").strip()
     service_name   = os.getenv("SERVICE_NAME", "processmanager-agent").strip()
 

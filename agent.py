@@ -297,19 +297,25 @@ async def run_agent(
                             if payload.get("nodeName") == hostname and payload.get("agentId") == agent_id:
                                 new_secret = str(payload.get("agentSecret", "")).strip()
                                 if new_secret:
-                                    # 서버가 발급한 노드 전용 secret을 .env에 저장해 다음 재접속부터 account-token을 쓰지 않습니다.
+                                    # 서버가 발급한 노드 전용 secret을 저장하고 1회용 설치 토큰은 로컬에서 비웁니다.
                                     env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
                                     lines = []
-                                    found = False
+                                    found_secret = False
+                                    found_account_token = False
                                     if os.path.exists(env_path):
                                         with open(env_path, "r", encoding="utf-8") as fh:
                                             for line in fh.read().splitlines():
                                                 if line.startswith("AGENT_SECRET="):
                                                     lines.append(f"AGENT_SECRET={new_secret}")
-                                                    found = True
+                                                    found_secret = True
+                                                elif line.startswith("ACCOUNT_TOKEN="):
+                                                    lines.append("ACCOUNT_TOKEN=")
+                                                    found_account_token = True
                                                 else:
                                                     lines.append(line)
-                                    if not found:
+                                    if not found_account_token:
+                                        lines.insert(0, "ACCOUNT_TOKEN=")
+                                    if not found_secret:
                                         lines.append(f"AGENT_SECRET={new_secret}")
                                     with open(env_path, "w", encoding="utf-8") as fh:
                                         fh.write("\n".join(lines) + "\n")

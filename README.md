@@ -29,12 +29,15 @@
 
 | 변수 | 필수 | 설명 | 기본값 |
 |------|------|------|--------|
-| ACCOUNT_TOKEN | O | 백엔드 인증 토큰 (메인 페이지에서 발급) | - |
+| ACCOUNT_TOKEN | △ | 최초 설치/재설치에 사용하는 1회용 설치 토큰 | - |
+| AGENT_SECRET | △ | 등록 후 재접속에 사용하는 노드 전용 secret | - |
 | SPRING_WS_URL | O | 백엔드 WebSocket URL | - |
 | HOSTNAME | X | 서버 식별 이름 | 시스템 호스트명 |
 | OS_TYPE | X | OS 종류 | Linux |
 | AGENT_PORT | X | HTTP API 포트 | 8888 |
 | LINUX_API_RELOAD | X | FastAPI 개발 모드 리로드 | false |
+
+`ACCOUNT_TOKEN`은 최초 등록이 끝나면 비워지고, 이후 재접속은 서버가 발급한 `AGENT_SECRET`으로 처리됩니다.
 
 ## 동작 원리
 
