@@ -33,11 +33,13 @@
 | AGENT_SECRET | △ | 등록 후 재접속에 사용하는 노드 전용 secret | - |
 | SPRING_WS_URL | O | 백엔드 WebSocket URL | - |
 | HOSTNAME | X | 서버 식별 이름 | 시스템 호스트명 |
-| OS_TYPE | X | OS 종류 | Linux |
+| OS_TYPE | X | OS 종류 (`Linux`, `Windows`) | 실행 OS |
 | AGENT_PORT | X | HTTP API 포트 | 8888 |
 | LINUX_API_RELOAD | X | FastAPI 개발 모드 리로드 | false |
 
 `ACCOUNT_TOKEN`은 최초 등록이 끝나면 비워지고, 이후 재접속은 서버가 발급한 `AGENT_SECRET`으로 처리됩니다.
+
+현재 Windows 에이전트는 실시간 모니터링 메트릭과 웹에서 삭제 시 작업 스케줄러/설치 폴더 제거를 지원합니다. 프로세스 제어, 서비스 제어, 터미널, 파일 조회, 자동 업데이트는 Linux 전용입니다.
 
 ## 동작 원리
 

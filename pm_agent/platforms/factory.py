@@ -14,4 +14,8 @@ def get_platform_adapter(os_type: str | None = None) -> PlatformAdapter:
         from pm_agent.platforms.linux.adapter import LinuxAdapter
 
         return LinuxAdapter()
+    if detected in {"windows", "win32", "windows-server"}:
+        from pm_agent.platforms.windows.adapter import WindowsAdapter
+
+        return WindowsAdapter()
     raise RuntimeError(f"지원하지 않는 운영체제입니다: {os_type or platform.system()}")

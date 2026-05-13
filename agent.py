@@ -397,8 +397,9 @@ async def run_agent(
                         # Uninstall command handling
                         if cmd_type == "uninstall":
                             if payload.get("nodeName") == hostname:
-                                print("[agent] uninstall command received; sending ack")
-                                # Send ACK first so the server can remove the node from the UI only after the agent receives the command.
+                                print("[agent] uninstall command received; starting self-removal")
+                                agent_dir = os.path.dirname(os.path.abspath(__file__))
+                                platform_adapter.start_self_uninstall(agent_dir, service_name)
                                 await websocket.send(stomp_frame(
                                     "SEND",
                                     {"destination": "/app/agent.uninstall-ack", "content-type": "application/json"},
@@ -408,9 +409,7 @@ async def run_agent(
                                         "stage": "started",
                                     }),
                                 ))
-                                print("[agent] uninstall ack sent; starting self-removal")
-                                agent_dir = os.path.dirname(os.path.abspath(__file__))
-                                platform_adapter.start_self_uninstall(agent_dir, service_name)
+                                print("[agent] uninstall ack sent")
                                 raise SystemExit(0)
                             continue
 
@@ -433,6 +432,9 @@ async def run_agent(
                             success = True
                         except HTTPException as exc:
                             message = exc.detail
+                            success = False
+                        except Exception as exc:
+                            message = str(exc)
                             success = False
 
                         await websocket.send(stomp_frame(
