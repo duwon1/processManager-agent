@@ -67,7 +67,21 @@ param(
 )
 
 $ErrorActionPreference = "SilentlyContinue"
-Start-Sleep -Seconds 3
+Start-Sleep -Seconds 5
+
+function Stop-AgentProcesses {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$TargetDir
+    )
+
+    $escaped = [System.Management.Automation.WildcardPattern]::Escape($TargetDir)
+    Get-CimInstance Win32_Process | Where-Object {
+        $_.ProcessId -ne $PID -and $_.CommandLine -like "*$escaped*"
+    } | ForEach-Object {
+        Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue
+    }
+}
 
 $task = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
 if ($task) {
@@ -76,7 +90,11 @@ if ($task) {
     Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false -ErrorAction SilentlyContinue
 }
 
-for ($i = 0; $i -lt 12; $i++) {
+& schtasks.exe /End /TN $TaskName 2>$null | Out-Null
+& schtasks.exe /Delete /TN $TaskName /F 2>$null | Out-Null
+
+for ($i = 0; $i -lt 30; $i++) {
+    Stop-AgentProcesses -TargetDir $AgentDir
     Remove-Item -LiteralPath $AgentDir -Recurse -Force -ErrorAction SilentlyContinue
     if (-not (Test-Path -LiteralPath $AgentDir)) {
         break

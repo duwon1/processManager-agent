@@ -4,7 +4,7 @@ from __future__ import annotations
 from typing import Any
 
 from pm_agent.platforms.base import PlatformAdapter
-from pm_agent.platforms.windows import metrics, uninstaller
+from pm_agent.platforms.windows import metrics, uninstaller, updater
 from pm_agent.platforms.windows.capabilities import WINDOWS_CAPABILITIES
 
 
@@ -78,7 +78,7 @@ class WindowsAdapter(PlatformAdapter):
         return None
 
     async def self_update(self, agent_dir: str) -> tuple[bool, str]:
-        return False, "Windows 자동 업데이트는 아직 지원하지 않습니다."
+        return await updater.self_update(agent_dir)
 
     def start_self_uninstall(self, agent_dir: str, service_name: str) -> None:
         uninstaller.start_self_uninstall(agent_dir, service_name)

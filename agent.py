@@ -5,6 +5,7 @@ import asyncio
 import json
 import os
 import subprocess
+import sys
 
 import websockets
 from fastapi import HTTPException
@@ -15,6 +16,14 @@ from stomp import stomp_frame, extract_stomp_body, extract_stomp_destination
 COMMAND_SUBSCRIPTION_ID = "agent-command-channel"
 SYSINFO_SUBSCRIPTION_ID = "sysinfo-request-channel"
 UPDATE_CHECK_INTERVAL_SECONDS = 10 * 60
+
+
+class _AgentShutdown(Exception):
+    """Request a whole-process shutdown after lifecycle work has been reported."""
+
+    def __init__(self, reason: str):
+        super().__init__(reason)
+        self.reason = reason
 
 
 def get_git_revisions(agent_dir: str) -> tuple[str, str, str]:
@@ -186,7 +195,7 @@ async def run_agent(
 
                         await report_update_result("pulled", True, (update_message or "업데이트 적용 후 재시작")[-400:])
                         print("[에이전트] 업데이트 적용 완료; 재시작합니다.")
-                        raise SystemExit(0)
+                        raise _AgentShutdown("update")
 
                 async def send_monitoring_loop():
                     """시스템 메트릭을 2초 간격으로 전송합니다."""
@@ -382,7 +391,7 @@ async def run_agent(
                             print("[agent] update check command received")
                             try:
                                 await check_and_apply_update("manual")
-                            except SystemExit:
+                            except _AgentShutdown:
                                 raise
                             except Exception as e:
                                 update_message = str(e)
@@ -410,7 +419,7 @@ async def run_agent(
                                     }),
                                 ))
                                 print("[agent] uninstall ack sent")
-                                raise SystemExit(0)
+                                raise _AgentShutdown("uninstall")
                             continue
 
                         # Terminal command handling
@@ -456,15 +465,23 @@ async def run_agent(
                             json.dumps(fresh),
                         ))
 
-                # 다섯 루프를 단일 연결에서 동시에 실행합니다.
-                await asyncio.gather(
-                    send_monitoring_loop(),
-                    send_process_loop(),
-                    send_service_loop(),
-                    send_terminal_output_loop(),
-                    receive_commands_loop(),
-                    check_update_loop(),
-                )
+                try:
+                    # 다섯 루프를 단일 연결에서 동시에 실행합니다.
+                    await asyncio.gather(
+                        send_monitoring_loop(),
+                        send_process_loop(),
+                        send_service_loop(),
+                        send_terminal_output_loop(),
+                        receive_commands_loop(),
+                        check_update_loop(),
+                    )
+                except _AgentShutdown as shutdown:
+                    print(f"[agent] lifecycle shutdown requested: {shutdown.reason}")
+                    platform_adapter.cleanup_terminals()
+                    await asyncio.sleep(0.2)
+                    sys.stdout.flush()
+                    sys.stderr.flush()
+                    os._exit(0)
 
         except Exception as e:
             print(f"[에이전트] 연결 에러 (5초 후 재시도): {e}")
