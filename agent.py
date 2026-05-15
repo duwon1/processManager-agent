@@ -275,7 +275,7 @@ async def run_agent(
                         destination = extract_stomp_destination(frame_text)
 
                         # ── 시스템 정보 수집 요청 ──
-                        if destination == f"/topic/agent.sysinfo-request.{agent_id}":
+                        if destination in ("/topic/agent.sysinfo-request", f"/topic/agent.sysinfo-request.{agent_id}"):
                             if payload.get("nodeName") == hostname:
                                 try:
                                     loop = asyncio.get_event_loop()
