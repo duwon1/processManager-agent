@@ -10,6 +10,6 @@ WINDOWS_CAPABILITIES = {
     "terminal": False,
     "fileList": False,
     "hardwareDetail": False,
-    "selfUpdate": False,
+    "selfUpdate": True,
     "selfUninstall": True,
 }
