@@ -3,13 +3,13 @@
 
 WINDOWS_CAPABILITIES = {
     "metrics": True,
-    "process": False,
-    "processKill": False,
+    "process": True,
+    "processKill": True,
     "serviceList": False,
     "serviceControl": False,
     "terminal": False,
     "fileList": False,
-    "hardwareDetail": False,
+    "hardwareDetail": True,
     "selfUpdate": True,
     "selfUninstall": True,
 }
