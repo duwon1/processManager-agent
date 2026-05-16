@@ -2,7 +2,9 @@
 from __future__ import annotations
 
 import os
+import json
 import socket
+import subprocess
 import time
 from pathlib import Path
 from typing import Any
@@ -30,6 +32,15 @@ _last_net_sent: int
 _last_net_recv: int
 _last_time: float
 _last_disk_io = psutil.disk_io_counters()
+_last_gpu_usage_value: float | None = None
+_last_gpu_usage_time = 0.0
+_last_memory_perf: dict[str, int] = {}
+_last_memory_perf_time = 0.0
+_last_memory_hardware: dict[str, Any] | None = None
+_last_memory_hardware_time = 0.0
+
+POWERSHELL_CACHE_SECONDS = 10
+MEMORY_HARDWARE_CACHE_SECONDS = 60
 
 
 def _metric(metric_id: int, value: Any) -> dict[str, Any]:
@@ -78,16 +89,166 @@ def _get_system_disk_path() -> str:
     return os.getcwd()
 
 
+def _run_powershell_json(script: str, timeout: int = 4) -> Any:
+    creationflags = 0
+    if hasattr(subprocess, "CREATE_NO_WINDOW"):
+        creationflags |= subprocess.CREATE_NO_WINDOW
+
+    command = (
+        "[Console]::OutputEncoding=[System.Text.Encoding]::UTF8; "
+        "$OutputEncoding=[System.Text.Encoding]::UTF8; "
+        f"{script.strip()} | ConvertTo-Json -Compress -Depth 5"
+    )
+    try:
+        result = subprocess.run(
+            ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", command],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=timeout,
+            creationflags=creationflags,
+        )
+    except Exception:
+        return None
+
+    if result.returncode != 0 or not result.stdout.strip():
+        return None
+
+    try:
+        return json.loads(result.stdout)
+    except json.JSONDecodeError:
+        return None
+
+
+def _as_list(value: Any) -> list[Any]:
+    if value is None:
+        return []
+    return value if isinstance(value, list) else [value]
+
+
+def _to_int(value: Any) -> int | None:
+    try:
+        if value is None or str(value).strip() == "":
+            return None
+        return int(float(value))
+    except (TypeError, ValueError):
+        return None
+
+
 def _get_gpu_usage() -> float | None:
+    global _last_gpu_usage_value, _last_gpu_usage_time
+
+    now = time.time()
+    if now - _last_gpu_usage_time < POWERSHELL_CACHE_SECONDS:
+        return _last_gpu_usage_value
+
+    data = _run_powershell_json(
+        "$samples = (Get-Counter '\\GPU Engine(*)\\Utilization Percentage' -ErrorAction SilentlyContinue).CounterSamples; "
+        "$value = ($samples | Measure-Object -Property CookedValue -Sum).Sum; "
+        "if ($null -eq $value) { $value = 0 }; "
+        "[pscustomobject]@{Usage=[Math]::Round([Math]::Min([double]$value, 100), 1)}",
+        timeout=5,
+    )
+    if isinstance(data, dict) and data.get("Usage") is not None:
+        try:
+            _last_gpu_usage_value = max(0.0, min(float(data["Usage"]), 100.0))
+            _last_gpu_usage_time = now
+            return _last_gpu_usage_value
+        except (TypeError, ValueError):
+            pass
+
     try:
         import GPUtil
 
         gpus = GPUtil.getGPUs()
         if gpus:
-            return round(gpus[0].load * 100, 1)
+            _last_gpu_usage_value = round(gpus[0].load * 100, 1)
+            _last_gpu_usage_time = now
+            return _last_gpu_usage_value
     except Exception:
         pass
+    _last_gpu_usage_value = None
+    _last_gpu_usage_time = now
     return None
+
+
+def _get_memory_perf() -> dict[str, int]:
+    global _last_memory_perf, _last_memory_perf_time
+
+    now = time.time()
+    if now - _last_memory_perf_time < POWERSHELL_CACHE_SECONDS:
+        return _last_memory_perf
+
+    data = _run_powershell_json(
+        "Get-CimInstance Win32_PerfRawData_PerfOS_Memory | "
+        "Select-Object CacheBytes,CommittedBytes,CommitLimit",
+        timeout=5,
+    )
+    next_perf: dict[str, int] = {}
+    if isinstance(data, dict):
+        for key in ("CacheBytes", "CommittedBytes", "CommitLimit"):
+            try:
+                value = data.get(key)
+                if value is not None:
+                    next_perf[key] = int(value)
+            except (TypeError, ValueError):
+                continue
+
+    _last_memory_perf = next_perf
+    _last_memory_perf_time = now
+    return _last_memory_perf
+
+
+def _memory_type_name(code: Any) -> str | None:
+    names = {
+        20: "DDR",
+        21: "DDR2",
+        24: "DDR3",
+        26: "DDR4",
+        34: "DDR5",
+    }
+    parsed = _to_int(code)
+    return names.get(parsed) if parsed is not None else None
+
+
+def _get_memory_hardware() -> dict[str, Any] | None:
+    global _last_memory_hardware, _last_memory_hardware_time
+
+    now = time.time()
+    if now - _last_memory_hardware_time < MEMORY_HARDWARE_CACHE_SECONDS:
+        return _last_memory_hardware
+
+    rows = _as_list(_run_powershell_json(
+        "Get-CimInstance Win32_PhysicalMemory | "
+        "Select-Object Capacity,Speed,ConfiguredClockSpeed,SMBIOSMemoryType",
+        timeout=5,
+    ))
+    modules = [row for row in rows if isinstance(row, dict)]
+    if not modules:
+        _last_memory_hardware = None
+        _last_memory_hardware_time = now
+        return None
+
+    capacities = [_to_int(row.get("Capacity")) for row in modules]
+    capacities = [capacity for capacity in capacities if capacity is not None]
+    speeds = [
+        _to_int(row.get("ConfiguredClockSpeed")) or _to_int(row.get("Speed"))
+        for row in modules
+    ]
+    speeds = [speed for speed in speeds if speed is not None]
+    memory_types = [_memory_type_name(row.get("SMBIOSMemoryType")) for row in modules]
+    memory_types = [memory_type for memory_type in memory_types if memory_type]
+
+    _last_memory_hardware = {
+        "slotsUsed": len(modules),
+        "perSlotBytes": capacities[0] if capacities else None,
+        "totalBytes": sum(capacities) if capacities else None,
+        "memoryType": memory_types[0] if memory_types else None,
+        "speedMtPerSecond": speeds[0] if speeds else None,
+    }
+    _last_memory_hardware_time = now
+    return _last_memory_hardware
 
 
 def collect_metrics() -> list[dict[str, Any]]:
@@ -123,8 +284,9 @@ def collect_metrics() -> list[dict[str, Any]]:
         disk_read_bps = disk_write_bps = None
     _last_disk_io = cur_disk
 
-    cached_bytes = getattr(mem, "cached", 0) or 0
-    committed_bytes = mem.used + getattr(swap, "used", 0)
+    memory_perf = _get_memory_perf()
+    cached_bytes = memory_perf.get("CacheBytes", getattr(mem, "cached", 0) or 0)
+    committed_bytes = memory_perf.get("CommittedBytes", mem.used + getattr(swap, "used", 0))
 
     return [
         _metric(1, cpu_percent),
@@ -140,7 +302,7 @@ def collect_metrics() -> list[dict[str, Any]]:
         _metric(11, committed_bytes),
         _metric(12, disk_read_bps),
         _metric(13, disk_write_bps),
-        _metric(14, None),
+        _metric(14, _get_memory_hardware()),
     ]
 
 
