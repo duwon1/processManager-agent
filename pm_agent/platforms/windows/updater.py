@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import os
 import shutil
 import subprocess
@@ -70,6 +71,50 @@ def _command_output(result: subprocess.CompletedProcess[str]) -> str:
 
 
 def _start_detached_restart(script_path: Path, task_name: str) -> None:
+    restart_task_name = f"ProcessManagerAgent-Restart-{uuid.uuid4().hex}"
+    if _start_scheduled_restart(script_path, task_name, restart_task_name):
+        return
+    _start_direct_restart(script_path, task_name)
+
+
+def _start_scheduled_restart(script_path: Path, task_name: str, restart_task_name: str) -> bool:
+    """Run restart work from a separate temporary scheduled task.
+
+    Stop-ScheduledTask can terminate the original task process tree. If the restart
+    script is only a child of that task, it can be killed before Start-ScheduledTask
+    runs. A temporary task avoids that self-kill path.
+    """
+    creationflags = 0
+    if hasattr(subprocess, "CREATE_NO_WINDOW"):
+        creationflags |= subprocess.CREATE_NO_WINDOW
+
+    register_script = f"""
+$ErrorActionPreference = "Stop"
+$taskName = {_ps_quote(task_name)}
+$restartTaskName = {_ps_quote(restart_task_name)}
+$scriptPath = {_ps_quote(str(script_path))}
+$argument = "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$scriptPath`" -TaskName `"$taskName`" -CleanupTaskName `"$restartTaskName`""
+$action = New-ScheduledTaskAction -Execute "powershell.exe" -Argument $argument
+$trigger = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(1)
+$settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit (New-TimeSpan -Minutes 5)
+Register-ScheduledTask -TaskName $restartTaskName -Action $action -Trigger $trigger -Settings $settings -Force | Out-Null
+Start-ScheduledTask -TaskName $restartTaskName
+"""
+    encoded = base64.b64encode(textwrap.dedent(register_script).encode("utf-16le")).decode("ascii")
+
+    result = subprocess.run(
+        ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-EncodedCommand", encoded],
+        text=True,
+        capture_output=True,
+        timeout=15,
+        check=False,
+        stdin=subprocess.DEVNULL,
+        creationflags=creationflags,
+    )
+    return result.returncode == 0
+
+
+def _start_direct_restart(script_path: Path, task_name: str) -> None:
     creationflags = 0
     if hasattr(subprocess, "CREATE_NO_WINDOW"):
         creationflags |= subprocess.CREATE_NO_WINDOW
@@ -97,12 +142,18 @@ def _start_detached_restart(script_path: Path, task_name: str) -> None:
     )
 
 
+def _ps_quote(value: str) -> str:
+    return "'" + value.replace("'", "''") + "'"
+
+
 def _write_restart_script() -> Path:
     script_path = Path(tempfile.gettempdir()) / f"processmanager-agent-restart-{uuid.uuid4().hex}.ps1"
     script = r'''
 param(
     [Parameter(Mandatory = $true)]
-    [string]$TaskName
+    [string]$TaskName,
+
+    [string]$CleanupTaskName = ""
 )
 
 $ErrorActionPreference = "SilentlyContinue"
@@ -121,8 +172,19 @@ if ($task) {
     if ($task.State -eq "Running") {
         Stop-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
         Start-Sleep -Seconds 1
+        for ($i = 0; $i -lt 20; $i++) {
+            $task = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
+            if (-not $task -or $task.State -ne "Running") {
+                break
+            }
+            Start-Sleep -Seconds 1
+        }
     }
     Start-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
+}
+
+if ($CleanupTaskName) {
+    Unregister-ScheduledTask -TaskName $CleanupTaskName -Confirm:$false -ErrorAction SilentlyContinue
 }
 
 Remove-Item -LiteralPath $PSCommandPath -Force -ErrorAction SilentlyContinue
