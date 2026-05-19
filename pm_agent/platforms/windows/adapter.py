@@ -35,6 +35,12 @@ class WindowsAdapter(PlatformAdapter):
     def collect_hardware(self) -> dict[str, Any]:
         return hardware.collect_hardware()
 
+    def start_hardware_sampler(self) -> None:
+        hardware.start_hardware_sampler()
+
+    def warm_hardware_cache(self) -> None:
+        hardware.warm_hardware_cache()
+
     def list_files(self, path: str) -> dict[str, Any]:
         return {
             "path": str(path or ""),

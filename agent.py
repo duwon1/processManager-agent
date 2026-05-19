@@ -99,6 +99,9 @@ async def run_agent(
     """단일 WebSocket 연결로 모니터링·프로세스 전송·kill 명령·터미널을 모두 처리합니다."""
     # 서버 통신은 공통으로 유지하고, OS 의존 기능은 adapter를 통해 실행합니다.
     platform_adapter = get_platform_adapter(os_type)
+    start_hardware_sampler = getattr(platform_adapter, "start_hardware_sampler", None)
+    if callable(start_hardware_sampler):
+        start_hardware_sampler()
     self_ip = platform_adapter.get_self_ip()
     update_lock = asyncio.Lock()
     print(f"[에이전트] STOMP 연결 시도: {url}")
@@ -330,13 +333,29 @@ async def run_agent(
                                 continue
                             try:
                                 loop = asyncio.get_event_loop()
+                                requested_node_id = payload.get("nodeId")
                                 info = await loop.run_in_executor(None, platform_adapter.collect_hardware)
-                                info["nodeId"] = payload.get("nodeId")
+                                info["nodeId"] = requested_node_id
                                 await websocket.send(stomp_frame(
                                     "SEND",
                                     {"destination": "/app/system-info", "content-type": "application/json"},
                                     json.dumps(info),
                                 ))
+                                if info.get("snapshotStatus") == "warming":
+                                    async def send_warmed_system_info(node_id):
+                                        try:
+                                            await asyncio.sleep(5)
+                                            refreshed = await loop.run_in_executor(None, platform_adapter.collect_hardware)
+                                            refreshed["nodeId"] = node_id
+                                            await websocket.send(stomp_frame(
+                                                "SEND",
+                                                {"destination": "/app/system-info", "content-type": "application/json"},
+                                                json.dumps(refreshed),
+                                            ))
+                                        except Exception as followup_error:
+                                            print(f"[에이전트] 시스템 정보 후속 전송 오류: {followup_error}")
+
+                                    asyncio.create_task(send_warmed_system_info(requested_node_id))
                                 print("[에이전트] 시스템 정보 전송 완료")
                             except Exception as e:
                                 print(f"[에이전트] 시스템 정보 수집 오류: {e}")

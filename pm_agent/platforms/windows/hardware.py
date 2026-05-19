@@ -1,20 +1,55 @@
 """Windows hardware detail collection."""
 from __future__ import annotations
 
+import copy
 import json
 import os
 import platform
 import socket
 import subprocess
+import threading
 import time
+from concurrent.futures import Future, ThreadPoolExecutor
 from typing import Any
 
 import psutil
 
 from pm_agent.platforms.windows.capabilities import WINDOWS_CAPABILITIES
 
+try:
+    from pm_agent.platforms.windows import native_gpu_usage
+except Exception:
+    native_gpu_usage = None
+
+try:
+    from pm_agent.platforms.windows import native_memory_perf
+except Exception:
+    native_memory_perf = None
+
 
 SCHEMA_VERSION = 1
+HARDWARE_SAMPLER_INTERVAL_SECONDS = 1.0
+HARDWARE_SNAPSHOT_STALE_SECONDS = 10.0
+STATIC_HARDWARE_CACHE_SECONDS = 600
+GPU_COUNTER_CACHE_SECONDS = 30
+MEMORY_PERF_CACHE_SECONDS = 30
+
+_latest_hardware_snapshot: dict[str, Any] | None = None
+_latest_hardware_snapshot_time = 0.0
+_latest_hardware_lock = threading.Lock()
+_first_snapshot_event = threading.Event()
+_sampler_started = False
+_sampler_lock = threading.Lock()
+_static_cache: dict[str, tuple[float, Any]] = {}
+_static_cache_lock = threading.Lock()
+_memory_perf_cache: dict[str, int] | None = None
+_memory_perf_cache_time = 0.0
+_memory_perf_refreshing = False
+_memory_perf_lock = threading.Lock()
+_gpu_counter_cache: dict[str, Any] | None = None
+_gpu_counter_cache_time = 0.0
+_gpu_counter_refreshing = False
+_gpu_counter_lock = threading.Lock()
 
 
 def _item(key: str, value: Any, unit: str = "text") -> dict[str, Any]:
@@ -33,7 +68,29 @@ def _section(key: str, items: list[dict[str, Any]], groups: list[dict[str, Any]]
     return payload
 
 
-def _run_powershell_json(script: str, timeout: int = 5) -> Any:
+def _cached_static(key: str, loader) -> Any:
+    now = time.time()
+    with _static_cache_lock:
+        cached = _static_cache.get(key)
+        if cached and now - cached[0] < STATIC_HARDWARE_CACHE_SECONDS:
+            return copy.deepcopy(cached[1])
+
+    value = loader()
+    with _static_cache_lock:
+        _static_cache[key] = (time.time(), copy.deepcopy(value))
+    return value
+
+
+def _get_cached_static(key: str) -> Any:
+    now = time.time()
+    with _static_cache_lock:
+        cached = _static_cache.get(key)
+        if cached and now - cached[0] < STATIC_HARDWARE_CACHE_SECONDS:
+            return copy.deepcopy(cached[1])
+    return None
+
+
+def _run_powershell_json(script: str, timeout: float = 5) -> Any:
     creationflags = 0
     if hasattr(subprocess, "CREATE_NO_WINDOW"):
         creationflags |= subprocess.CREATE_NO_WINDOW
@@ -125,9 +182,12 @@ def _memory_form_factor(code: Any) -> str | None:
 
 
 def _collect_physical_memory() -> dict[str, Any]:
-    rows = _as_list(_run_powershell_json(
-        "Get-CimInstance Win32_PhysicalMemory | "
-        "Select-Object Capacity,Speed,ConfiguredClockSpeed,FormFactor,MemoryType,SMBIOSMemoryType"
+    rows = _as_list(_cached_static(
+        "physical_memory",
+        lambda: _run_powershell_json(
+            "Get-CimInstance Win32_PhysicalMemory | "
+            "Select-Object Capacity,Speed,ConfiguredClockSpeed,FormFactor,MemoryType,SMBIOSMemoryType"
+        ),
     ))
     if not rows:
         return {}
@@ -155,11 +215,14 @@ def _collect_physical_memory() -> dict[str, Any]:
 
 def _collect_cpu() -> dict[str, Any]:
     freq = psutil.cpu_freq()
-    rows = _as_list(_run_powershell_json(
-        "Get-CimInstance Win32_Processor | "
-        "Select-Object Name,NumberOfCores,NumberOfLogicalProcessors,MaxClockSpeed,"
-        "CurrentClockSpeed,SocketDesignation,VirtualizationFirmwareEnabled,L2CacheSize,L3CacheSize",
-        timeout=5,
+    rows = _as_list(_cached_static(
+        "cpu_inventory",
+        lambda: _run_powershell_json(
+            "Get-CimInstance Win32_Processor | "
+            "Select-Object Name,NumberOfCores,NumberOfLogicalProcessors,MaxClockSpeed,"
+            "CurrentClockSpeed,SocketDesignation,VirtualizationFirmwareEnabled,L2CacheSize,L3CacheSize",
+            timeout=5,
+        ),
     ))
     cpus = [row for row in rows if isinstance(row, dict)]
     first = cpus[0] if cpus else {}
@@ -190,7 +253,12 @@ def _collect_cpu() -> dict[str, Any]:
     }
 
 
-def _collect_memory_perf() -> dict[str, int]:
+def _read_memory_perf() -> dict[str, int]:
+    if native_memory_perf is not None:
+        perf = native_memory_perf.read_memory_perf()
+        if perf:
+            return perf
+
     data = _run_powershell_json(
         "Get-CimInstance Win32_PerfRawData_PerfOS_Memory | "
         "Select-Object CacheBytes,CommittedBytes,CommitLimit",
@@ -205,6 +273,43 @@ def _collect_memory_perf() -> dict[str, int]:
         if value is not None:
             result[key] = value
     return result
+
+
+def _refresh_memory_perf() -> None:
+    global _memory_perf_cache, _memory_perf_cache_time, _memory_perf_refreshing
+
+    try:
+        perf = _read_memory_perf()
+        with _memory_perf_lock:
+            _memory_perf_cache = perf
+            _memory_perf_cache_time = time.time()
+    finally:
+        with _memory_perf_lock:
+            _memory_perf_refreshing = False
+
+
+def _schedule_memory_perf_refresh() -> None:
+    global _memory_perf_refreshing
+
+    with _memory_perf_lock:
+        if _memory_perf_refreshing:
+            return
+        _memory_perf_refreshing = True
+
+    thread = threading.Thread(target=_refresh_memory_perf, name="pm-memory-perf", daemon=True)
+    thread.start()
+
+
+def _collect_memory_perf() -> dict[str, int]:
+    now = time.time()
+    with _memory_perf_lock:
+        cached = copy.deepcopy(_memory_perf_cache)
+        cache_time = _memory_perf_cache_time
+
+    if cached is None or now - cache_time >= MEMORY_PERF_CACHE_SECONDS:
+        _schedule_memory_perf_refresh()
+
+    return cached if cached is not None else {}
 
 
 def _collect_memory() -> dict[str, Any]:
@@ -280,7 +385,24 @@ Get-CimInstance Win32_LogicalDisk -Filter 'DriveType=3' | ForEach-Object {
   }
 }
 """
-    return [row for row in _as_list(_run_powershell_json(script, timeout=10)) if isinstance(row, dict)]
+    rows = _cached_static("disk_inventory", lambda: _run_powershell_json(script, timeout=10))
+    return [_with_live_disk_usage(row) for row in _as_list(rows) if isinstance(row, dict)]
+
+
+def _with_live_disk_usage(row: dict[str, Any]) -> dict[str, Any]:
+    device_id = _clean_text(row.get("DeviceId"))
+    if not device_id:
+        return row
+
+    try:
+        usage = psutil.disk_usage(f"{device_id}\\")
+    except (PermissionError, OSError):
+        return row
+
+    next_row = dict(row)
+    next_row["Size"] = usage.total
+    next_row["FreeSpace"] = usage.free
+    return next_row
 
 
 def _physical_disk_key(row: dict[str, Any]) -> str:
@@ -417,10 +539,13 @@ def _connection_type(name: str) -> str:
 
 
 def _collect_network_inventory() -> dict[str, dict[str, Any]]:
-    rows = _as_list(_run_powershell_json(
-        "Get-CimInstance Win32_NetworkAdapter -Filter 'NetEnabled=True' | "
-        "Select-Object Name,NetConnectionID,Description,AdapterType,Speed,MACAddress,PhysicalAdapter",
-        timeout=5,
+    rows = _as_list(_cached_static(
+        "network_inventory",
+        lambda: _run_powershell_json(
+            "Get-CimInstance Win32_NetworkAdapter -Filter 'NetEnabled=True' | "
+            "Select-Object Name,NetConnectionID,Description,AdapterType,Speed,MACAddress,PhysicalAdapter",
+            timeout=5,
+        ),
     ))
     result: dict[str, dict[str, Any]] = {}
     for row in rows:
@@ -535,7 +660,23 @@ def _extract_counter_values(value: Any) -> list[int]:
     return values
 
 
-def _collect_gpu_counters() -> dict[str, Any]:
+def _empty_gpu_counters() -> dict[str, Any]:
+    return {"dedicated": [], "shared": [], "usagePercent": None}
+
+
+def _read_gpu_counters() -> dict[str, Any]:
+    if native_gpu_usage is not None:
+        memory = native_gpu_usage.read_memory_usage_bytes()
+        usage = native_gpu_usage.read_usage_percent()
+        dedicated = memory.get("dedicated", []) if isinstance(memory, dict) else []
+        shared = memory.get("shared", []) if isinstance(memory, dict) else []
+        if dedicated or shared or usage is not None:
+            return {
+                "dedicated": dedicated,
+                "shared": shared,
+                "usagePercent": usage,
+            }
+
     data = _run_powershell_json(
         "$dedicated = @(Get-Counter '\\GPU Adapter Memory(*)\\Dedicated Usage' -ErrorAction SilentlyContinue).CounterSamples | Select-Object Path,CookedValue; "
         "$shared = @(Get-Counter '\\GPU Adapter Memory(*)\\Shared Usage' -ErrorAction SilentlyContinue).CounterSamples | Select-Object Path,CookedValue; "
@@ -556,12 +697,52 @@ def _collect_gpu_counters() -> dict[str, Any]:
             "shared": _extract_counter_values(data.get("Shared")),
             "usagePercent": usage,
         }
-    return {"dedicated": [], "shared": [], "usagePercent": None}
+    return _empty_gpu_counters()
+
+
+def _refresh_gpu_counters() -> None:
+    global _gpu_counter_cache, _gpu_counter_cache_time, _gpu_counter_refreshing
+
+    try:
+        counters = _read_gpu_counters()
+        with _gpu_counter_lock:
+            _gpu_counter_cache = counters
+            _gpu_counter_cache_time = time.time()
+    finally:
+        with _gpu_counter_lock:
+            _gpu_counter_refreshing = False
+
+
+def _schedule_gpu_counter_refresh() -> None:
+    global _gpu_counter_refreshing
+
+    with _gpu_counter_lock:
+        if _gpu_counter_refreshing:
+            return
+        _gpu_counter_refreshing = True
+
+    thread = threading.Thread(target=_refresh_gpu_counters, name="pm-gpu-counters", daemon=True)
+    thread.start()
+
+
+def _collect_gpu_counters() -> dict[str, Any]:
+    now = time.time()
+    with _gpu_counter_lock:
+        cached = copy.deepcopy(_gpu_counter_cache)
+        cache_time = _gpu_counter_cache_time
+
+    if cached is None or now - cache_time >= GPU_COUNTER_CACHE_SECONDS:
+        _schedule_gpu_counter_refresh()
+
+    return cached if cached is not None else _empty_gpu_counters()
 
 
 def _collect_gpus() -> list[dict[str, Any]]:
-    rows = _as_list(_run_powershell_json(
-        "Get-CimInstance Win32_VideoController | Select-Object Name,DriverVersion,AdapterRAM"
+    rows = _as_list(_cached_static(
+        "gpu_inventory",
+        lambda: _run_powershell_json(
+            "Get-CimInstance Win32_VideoController | Select-Object Name,DriverVersion,AdapterRAM"
+        ),
     ))
     gpus: list[dict[str, Any]] = []
     counters = _collect_gpu_counters()
@@ -688,13 +869,20 @@ def _sections(cpu: dict[str, Any], memory: dict[str, Any], disks: list[dict[str,
     ]
 
 
-def collect_hardware() -> dict[str, Any]:
-    cpu = _collect_cpu()
-    memory = _collect_memory()
-    disks = _collect_disks()
-    networks = _collect_networks()
-    gpus = _collect_gpus()
+def _future_result(future: Future, fallback: Any) -> Any:
+    try:
+        return future.result()
+    except Exception:
+        return fallback
 
+
+def _build_hardware_payload(
+    cpu: dict[str, Any],
+    memory: dict[str, Any],
+    disks: list[dict[str, Any]],
+    networks: list[dict[str, Any]],
+    gpus: list[dict[str, Any]],
+) -> dict[str, Any]:
     return {
         "schemaVersion": SCHEMA_VERSION,
         "osType": "Windows",
@@ -746,3 +934,214 @@ def collect_hardware() -> dict[str, Any]:
         "gpus": gpus,
         "sections": _sections(cpu, memory, disks, networks, gpus),
     }
+
+
+def _collect_hardware_snapshot() -> dict[str, Any]:
+    with ThreadPoolExecutor(max_workers=5) as executor:
+        cpu_future = executor.submit(_collect_cpu)
+        memory_future = executor.submit(_collect_memory)
+        disks_future = executor.submit(_collect_disks)
+        networks_future = executor.submit(_collect_networks)
+        gpus_future = executor.submit(_collect_gpus)
+
+        cpu = _future_result(cpu_future, {})
+        memory = _future_result(memory_future, {})
+        disks = _future_result(disks_future, [])
+        networks = _future_result(networks_future, [])
+        gpus = _future_result(gpus_future, [])
+
+    return _build_hardware_payload(cpu, memory, disks, networks, gpus)
+
+
+def _collect_cpu_quick() -> dict[str, Any]:
+    freq = psutil.cpu_freq()
+    return {
+        "model": platform.processor() or os.getenv("PROCESSOR_IDENTIFIER") or None,
+        "sockets": 1,
+        "cores": psutil.cpu_count(logical=False) or 1,
+        "logicalProcessors": psutil.cpu_count(logical=True) or 1,
+        "baseSpeedMhz": round(freq.max, 1) if freq and freq.max else None,
+        "currentSpeedMhz": round(freq.current, 1) if freq else None,
+        "virtualization": None,
+        "l2CacheBytes": None,
+        "l3CacheBytes": None,
+        "uptimeSeconds": int(time.time() - psutil.boot_time()),
+    }
+
+
+def _collect_memory_quick() -> dict[str, Any]:
+    mem = psutil.virtual_memory()
+    swap = psutil.swap_memory()
+    perf = _collect_memory_perf()
+    physical = _get_cached_static("physical_memory")
+
+    result = {
+        "totalBytes": mem.total,
+        "usedBytes": mem.used,
+        "availableBytes": mem.available,
+        "usagePercent": round(mem.percent, 1),
+        "cachedBytes": perf.get("CacheBytes", getattr(mem, "cached", 0) or 0),
+        "committedBytes": perf.get("CommittedBytes", mem.used + getattr(swap, "used", 0)),
+        "commitLimitBytes": perf.get("CommitLimit", mem.total + getattr(swap, "total", 0)),
+    }
+    if physical is not None:
+        result.update(_collect_physical_memory())
+    return result
+
+
+def _collect_disks_quick() -> list[dict[str, Any]]:
+    if _get_cached_static("disk_inventory") is not None:
+        return _collect_disks()
+
+    system_drive = (os.getenv("SystemDrive") or "C:").rstrip("\\")
+    system_mount = f"{system_drive}\\"
+    disks = []
+    for partition in psutil.disk_partitions(all=False):
+        if partition.mountpoint.rstrip("\\").lower() != system_mount.rstrip("\\").lower():
+            continue
+        try:
+            usage = psutil.disk_usage(partition.mountpoint)
+        except (PermissionError, OSError):
+            continue
+
+        disks.append({
+            "mountpoint": partition.mountpoint,
+            "partitions": partition.mountpoint,
+            "device": partition.device,
+            "fstype": partition.fstype,
+            "totalBytes": usage.total,
+            "usedBytes": usage.used,
+            "freeBytes": usage.free,
+            "usagePercent": round(usage.percent, 1),
+            "readBytesPerSecond": None,
+            "writeBytesPerSecond": None,
+            "type": None,
+            "model": None,
+        })
+    return disks
+
+
+def _collect_networks_quick() -> list[dict[str, Any]]:
+    networks = []
+    stats = psutil.net_if_stats()
+    for name, addresses in psutil.net_if_addrs().items():
+        if _is_loopback(name):
+            continue
+        stat = stats.get(name)
+        if stat and not stat.isup:
+            continue
+
+        ipv4 = ""
+        ipv6 = ""
+        for address in addresses:
+            if address.family == socket.AF_INET:
+                ipv4 = address.address
+            elif address.family == socket.AF_INET6:
+                ipv6 = address.address
+
+        if not ipv4 and not ipv6:
+            continue
+
+        networks.append({
+            "adapterName": name,
+            "connectionType": _connection_type(name),
+            "ipv4": ipv4,
+            "ipv6": ipv6,
+            "model": None,
+            "speedBitsPerSecond": None,
+            "macAddress": None,
+            "ssid": None,
+            "signalStrengthDbm": None,
+        })
+    return networks
+
+
+def _collect_gpus_quick() -> list[dict[str, Any]]:
+    rows = _as_list(_get_cached_static("gpu_inventory"))
+    gpus = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        gpus.append({
+            "model": _clean_text(row.get("Name")),
+            "driverVersion": _clean_text(row.get("DriverVersion")),
+            "dedicatedMemoryBytes": _first_number(row.get("AdapterRAM")),
+            "usedMemoryBytes": None,
+            "sharedMemoryBytes": None,
+            "usagePercent": None,
+        })
+    return gpus
+
+
+def _collect_quick_hardware_snapshot() -> dict[str, Any]:
+    snapshot = _build_hardware_payload(
+        _collect_cpu_quick(),
+        _collect_memory_quick(),
+        _collect_disks_quick(),
+        _collect_networks_quick(),
+        _collect_gpus_quick(),
+    )
+    snapshot["snapshotStatus"] = "warming"
+    return snapshot
+
+
+def _store_hardware_snapshot(snapshot: dict[str, Any]) -> None:
+    global _latest_hardware_snapshot, _latest_hardware_snapshot_time
+
+    with _latest_hardware_lock:
+        _latest_hardware_snapshot = copy.deepcopy(snapshot)
+        _latest_hardware_snapshot_time = time.time()
+    _first_snapshot_event.set()
+
+
+def _get_hardware_snapshot(max_age_seconds: float | None = None) -> dict[str, Any] | None:
+    with _latest_hardware_lock:
+        if _latest_hardware_snapshot is None:
+            return None
+        if max_age_seconds is not None and time.time() - _latest_hardware_snapshot_time > max_age_seconds:
+            return None
+        return copy.deepcopy(_latest_hardware_snapshot)
+
+
+def _hardware_sampler_loop() -> None:
+    while True:
+        started_at = time.perf_counter()
+        try:
+            _store_hardware_snapshot(_collect_hardware_snapshot())
+        except Exception:
+            pass
+
+        elapsed = time.perf_counter() - started_at
+        time.sleep(max(0.0, HARDWARE_SAMPLER_INTERVAL_SECONDS - elapsed))
+
+
+def start_hardware_sampler() -> None:
+    global _sampler_started
+
+    with _sampler_lock:
+        if _sampler_started:
+            return
+        _sampler_started = True
+
+    thread = threading.Thread(target=_hardware_sampler_loop, name="pm-hardware-sampler", daemon=True)
+    thread.start()
+
+
+def warm_hardware_cache() -> None:
+    start_hardware_sampler()
+
+
+def collect_hardware() -> dict[str, Any]:
+    start_hardware_sampler()
+    snapshot = _get_hardware_snapshot(HARDWARE_SNAPSHOT_STALE_SECONDS)
+    if snapshot is not None:
+        return snapshot
+
+    if _first_snapshot_event.wait(timeout=0.1):
+        snapshot = _get_hardware_snapshot(HARDWARE_SNAPSHOT_STALE_SECONDS)
+        if snapshot is not None:
+            return snapshot
+
+    snapshot = _collect_quick_hardware_snapshot()
+    _store_hardware_snapshot(snapshot)
+    return snapshot
