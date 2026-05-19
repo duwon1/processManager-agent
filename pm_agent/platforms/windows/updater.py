@@ -19,7 +19,7 @@ def ensure_runtime_layout(agent_dir: str, task_name: str) -> tuple[bool, str]:
 
     try:
         runner_path = _write_runner_scripts(target_dir)
-        launcher_success, launcher_message = _update_task_launcher(target_dir, task_name, runner_path)
+        launcher_success, launcher_message = _update_task_registration(target_dir, task_name, runner_path)
         cleanup_success, cleanup_message = _cleanup_restart_tasks()
     except Exception as exc:
         return False, str(exc)
@@ -174,7 +174,7 @@ with log_file.open("a", encoding="utf-8", buffering=1) as log:
     return pyw_path
 
 
-def _update_task_launcher(agent_dir: Path, task_name: str, runner_path: Path) -> tuple[bool, str]:
+def _update_task_registration(agent_dir: Path, task_name: str, runner_path: Path) -> tuple[bool, str]:
     pythonw_path = agent_dir / ".venv" / "Scripts" / "pythonw.exe"
     if not pythonw_path.exists():
         return False, f"pythonw not found: {pythonw_path}"
@@ -190,19 +190,28 @@ if (-not $task) {{
     Write-Output "scheduled task not found"
     exit 0
 }}
-$current = @($task.Actions)[0]
 $expectedArgument = "`"$runner`""
-if ($current -and $current.Execute -ieq $pythonw -and $current.Arguments -eq $expectedArgument) {{
-    Write-Output "launcher already current"
-    exit 0
-}}
 $action = New-ScheduledTaskAction -Execute $pythonw -Argument $expectedArgument -WorkingDirectory $agentDir
-Set-ScheduledTask -TaskName $taskName -Action $action | Out-Null
-Write-Output "launcher updated"
+$logonTrigger = New-ScheduledTaskTrigger -AtLogOn
+$watchdogTrigger = New-ScheduledTaskTrigger `
+    -Once `
+    -At (Get-Date).AddMinutes(1) `
+    -RepetitionInterval (New-TimeSpan -Minutes 1) `
+    -RepetitionDuration (New-TimeSpan -Days 3650)
+$settings = New-ScheduledTaskSettingsSet `
+    -AllowStartIfOnBatteries `
+    -DontStopIfGoingOnBatteries `
+    -ExecutionTimeLimit ([TimeSpan]::Zero) `
+    -MultipleInstances IgnoreNew `
+    -StartWhenAvailable `
+    -RestartCount 3 `
+    -RestartInterval (New-TimeSpan -Minutes 1)
+Set-ScheduledTask -TaskName $taskName -Action $action -Trigger @($logonTrigger, $watchdogTrigger) -Settings $settings | Out-Null
+Write-Output "task registration updated"
 """
     result = _run_hidden_powershell(script, timeout=20)
     success = result.returncode == 0
-    return success, _command_output(result) or ("launcher updated" if success else "launcher update failed")
+    return success, _command_output(result) or ("task registration updated" if success else "task registration update failed")
 
 
 def _cleanup_restart_tasks() -> tuple[bool, str]:
