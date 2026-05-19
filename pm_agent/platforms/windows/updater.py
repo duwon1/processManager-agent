@@ -12,6 +12,24 @@ import uuid
 from pathlib import Path
 
 
+def ensure_runtime_layout(agent_dir: str, task_name: str) -> tuple[bool, str]:
+    target_dir = Path(agent_dir).resolve()
+    if not _looks_like_agent_dir(target_dir):
+        return False, f"unexpected agent directory: {target_dir}"
+
+    try:
+        runner_path = _write_runner_scripts(target_dir)
+        launcher_success, launcher_message = _update_task_launcher(target_dir, task_name, runner_path)
+        cleanup_success, cleanup_message = _cleanup_restart_tasks()
+    except Exception as exc:
+        return False, str(exc)
+
+    messages = [launcher_message, cleanup_message]
+    if not launcher_success or not cleanup_success:
+        return False, "; ".join(message for message in messages if message)
+    return True, "Windows runtime layout checked"
+
+
 async def self_update(agent_dir: str) -> tuple[bool, str]:
     """Pull the latest agent source, refresh dependencies, and restart the scheduled task."""
     target_dir = Path(agent_dir).resolve()
@@ -66,9 +84,11 @@ async def self_update(agent_dir: str) -> tuple[bool, str]:
     if pip_result.returncode != 0:
         return False, _command_output(pip_result) or "pip install failed"
 
-    _write_runner_script(target_dir)
-
     task_name = os.getenv("SERVICE_NAME", "ProcessManagerAgent").strip() or "ProcessManagerAgent"
+    layout_success, layout_message = ensure_runtime_layout(str(target_dir), task_name)
+    if not layout_success:
+        return False, layout_message
+
     restart_script = _write_restart_script()
     _start_detached_restart(restart_script, task_name)
 
@@ -108,9 +128,10 @@ def _hidden_subprocess_kwargs(detached: bool = False) -> dict:
     return kwargs
 
 
-def _write_runner_script(agent_dir: Path) -> None:
-    runner_path = agent_dir / "run-agent.ps1"
-    script = r'''
+def _write_runner_scripts(agent_dir: Path) -> Path:
+    ps1_path = agent_dir / "run-agent.ps1"
+    pyw_path = agent_dir / "run-agent.pyw"
+    ps1_script = r'''
 $ErrorActionPreference = "Stop"
 Set-Location -LiteralPath $PSScriptRoot
 $logDir = Join-Path $PSScriptRoot "logs"
@@ -121,7 +142,94 @@ $env:PYTHONUNBUFFERED = "1"
 & $python main.py >> $logFile 2>&1
 exit $LASTEXITCODE
 '''
-    runner_path.write_text(textwrap.dedent(script).strip() + os.linesep, encoding="utf-8")
+    pyw_script = r'''
+from pathlib import Path
+import os
+import runpy
+import sys
+import traceback
+
+base_dir = Path(__file__).resolve().parent
+os.chdir(base_dir)
+
+log_dir = base_dir / "logs"
+log_dir.mkdir(exist_ok=True)
+log_file = log_dir / "agent.log"
+
+with log_file.open("a", encoding="utf-8", buffering=1) as log:
+    sys.stdout = log
+    sys.stderr = log
+    os.environ["PYTHONUNBUFFERED"] = "1"
+    try:
+        runpy.run_path(str(base_dir / "main.py"), run_name="__main__")
+    except SystemExit:
+        raise
+    except Exception:
+        traceback.print_exc()
+        raise
+'''
+    ps1_path.write_text(textwrap.dedent(ps1_script).strip() + os.linesep, encoding="utf-8")
+    pyw_path.write_text(textwrap.dedent(pyw_script).strip() + os.linesep, encoding="utf-8")
+    return pyw_path
+
+
+def _update_task_launcher(agent_dir: Path, task_name: str, runner_path: Path) -> tuple[bool, str]:
+    pythonw_path = agent_dir / ".venv" / "Scripts" / "pythonw.exe"
+    if not pythonw_path.exists():
+        return False, f"pythonw not found: {pythonw_path}"
+
+    script = f"""
+$ErrorActionPreference = "Stop"
+$taskName = {_ps_quote(task_name)}
+$agentDir = {_ps_quote(str(agent_dir))}
+$pythonw = {_ps_quote(str(pythonw_path))}
+$runner = {_ps_quote(str(runner_path))}
+$task = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
+if (-not $task) {{
+    Write-Output "scheduled task not found"
+    exit 0
+}}
+$current = @($task.Actions)[0]
+$expectedArgument = "`"$runner`""
+if ($current -and $current.Execute -ieq $pythonw -and $current.Arguments -eq $expectedArgument) {{
+    Write-Output "launcher already current"
+    exit 0
+}}
+$action = New-ScheduledTaskAction -Execute $pythonw -Argument $expectedArgument -WorkingDirectory $agentDir
+Set-ScheduledTask -TaskName $taskName -Action $action | Out-Null
+Write-Output "launcher updated"
+"""
+    result = _run_hidden_powershell(script, timeout=20)
+    success = result.returncode == 0
+    return success, _command_output(result) or ("launcher updated" if success else "launcher update failed")
+
+
+def _cleanup_restart_tasks() -> tuple[bool, str]:
+    script = r'''
+$ErrorActionPreference = "Stop"
+$tasks = @(Get-ScheduledTask -TaskName "ProcessManagerAgent-Restart-*" -ErrorAction SilentlyContinue)
+foreach ($task in $tasks) {
+    Stop-ScheduledTask -TaskName $task.TaskName -ErrorAction SilentlyContinue
+    Unregister-ScheduledTask -TaskName $task.TaskName -Confirm:$false -ErrorAction SilentlyContinue
+}
+Write-Output "restart task cleanup: $($tasks.Count)"
+'''
+    result = _run_hidden_powershell(script, timeout=20)
+    success = result.returncode == 0
+    return success, _command_output(result) or ("restart tasks cleaned" if success else "restart task cleanup failed")
+
+
+def _run_hidden_powershell(script: str, timeout: int) -> subprocess.CompletedProcess[str]:
+    encoded = base64.b64encode(textwrap.dedent(script).encode("utf-16le")).decode("ascii")
+    return subprocess.run(
+        ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-EncodedCommand", encoded],
+        text=True,
+        capture_output=True,
+        timeout=timeout,
+        check=False,
+        stdin=subprocess.DEVNULL,
+        **_hidden_subprocess_kwargs(),
+    )
 
 
 def _start_detached_restart(script_path: Path, task_name: str) -> None:
@@ -143,8 +251,8 @@ $ErrorActionPreference = "Stop"
 $taskName = {_ps_quote(task_name)}
 $restartTaskName = {_ps_quote(restart_task_name)}
 $scriptPath = {_ps_quote(str(script_path))}
-$argument = "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$scriptPath`" -TaskName `"$taskName`" -CleanupTaskName `"$restartTaskName`""
-$action = New-ScheduledTaskAction -Execute "powershell.exe" -Argument $argument
+$launcherPath = {_ps_quote(str(_write_restart_launcher(script_path, task_name, restart_task_name)))}
+$action = New-ScheduledTaskAction -Execute "wscript.exe" -Argument "//B //Nologo `"$launcherPath`""
 $trigger = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(1)
 $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit (New-TimeSpan -Minutes 5)
 Register-ScheduledTask -TaskName $restartTaskName -Action $action -Trigger $trigger -Settings $settings -Force | Out-Null
@@ -190,6 +298,36 @@ def _ps_quote(value: str) -> str:
     return "'" + value.replace("'", "''") + "'"
 
 
+def _vbs_quote(value: str) -> str:
+    return '"' + value.replace('"', '""') + '"'
+
+
+def _write_restart_launcher(script_path: Path, task_name: str, restart_task_name: str) -> Path:
+    launcher_path = Path(tempfile.gettempdir()) / f"processmanager-agent-restart-{uuid.uuid4().hex}.vbs"
+    command = " ".join([
+        "powershell.exe",
+        "-NoProfile",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-WindowStyle",
+        "Hidden",
+        "-File",
+        _vbs_quote(str(script_path)),
+        "-TaskName",
+        _vbs_quote(task_name),
+        "-CleanupTaskName",
+        _vbs_quote(restart_task_name),
+        "-CleanupLauncherPath",
+        _vbs_quote(str(launcher_path)),
+    ])
+    script = f'''
+Set shell = CreateObject("WScript.Shell")
+shell.Run {_vbs_quote(command)}, 0, False
+'''
+    launcher_path.write_text(textwrap.dedent(script).strip() + os.linesep, encoding="utf-8")
+    return launcher_path
+
+
 def _write_restart_script() -> Path:
     script_path = Path(tempfile.gettempdir()) / f"processmanager-agent-restart-{uuid.uuid4().hex}.ps1"
     script = r'''
@@ -197,7 +335,9 @@ param(
     [Parameter(Mandatory = $true)]
     [string]$TaskName,
 
-    [string]$CleanupTaskName = ""
+    [string]$CleanupTaskName = "",
+
+    [string]$CleanupLauncherPath = ""
 )
 
 $ErrorActionPreference = "SilentlyContinue"
@@ -229,6 +369,10 @@ if ($task) {
 
 if ($CleanupTaskName) {
     Unregister-ScheduledTask -TaskName $CleanupTaskName -Confirm:$false -ErrorAction SilentlyContinue
+}
+
+if ($CleanupLauncherPath) {
+    Remove-Item -LiteralPath $CleanupLauncherPath -Force -ErrorAction SilentlyContinue
 }
 
 Remove-Item -LiteralPath $PSCommandPath -Force -ErrorAction SilentlyContinue
