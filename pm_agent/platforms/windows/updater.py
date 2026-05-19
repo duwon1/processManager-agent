@@ -38,13 +38,28 @@ async def self_update(agent_dir: str) -> tuple[bool, str]:
     if not python_path.exists():
         return False, f"Python venv not found: {python_path}"
 
+    pip_env = os.environ.copy()
+    pip_env["PIP_NO_CACHE_DIR"] = "1"
+    pip_env["PIP_DISABLE_PIP_VERSION_CHECK"] = "1"
+
     pip_result = await asyncio.to_thread(
         subprocess.run,
-        [str(python_path), "-m", "pip", "install", "-r", str(requirements_path), "-q"],
+        [
+            str(python_path),
+            "-m",
+            "pip",
+            "install",
+            "--no-cache-dir",
+            "--disable-pip-version-check",
+            "-r",
+            str(requirements_path),
+            "-q",
+        ],
         text=True,
         capture_output=True,
         timeout=180,
         check=False,
+        env=pip_env,
     )
     if pip_result.returncode != 0:
         return False, _command_output(pip_result) or "pip install failed"
