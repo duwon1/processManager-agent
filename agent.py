@@ -28,6 +28,26 @@ class _AgentShutdown(Exception):
         self.reason = reason
 
 
+def _hidden_subprocess_kwargs() -> dict:
+    if os.name != "nt":
+        return {}
+
+    kwargs = {}
+    creationflags = 0
+    if hasattr(subprocess, "CREATE_NO_WINDOW"):
+        creationflags |= subprocess.CREATE_NO_WINDOW
+    if creationflags:
+        kwargs["creationflags"] = creationflags
+
+    if hasattr(subprocess, "STARTUPINFO"):
+        startupinfo = subprocess.STARTUPINFO()
+        startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+        startupinfo.wShowWindow = 0
+        kwargs["startupinfo"] = startupinfo
+
+    return kwargs
+
+
 def get_git_revisions(agent_dir: str) -> tuple[str, str, str]:
     """로컬/원격 Git 커밋을 조회해 에이전트 업데이트 필요 여부 판단에 사용합니다."""
     try:
@@ -35,6 +55,7 @@ def get_git_revisions(agent_dir: str) -> tuple[str, str, str]:
             ["git", "-C", agent_dir, "rev-parse", "HEAD"],
             text=True,
             timeout=5,
+            **_hidden_subprocess_kwargs(),
         ).strip()[:7]
     except Exception as exc:
         current_sha = "unknown"
@@ -45,6 +66,7 @@ def get_git_revisions(agent_dir: str) -> tuple[str, str, str]:
             ["git", "-C", agent_dir, "ls-remote", "origin", "HEAD"],
             text=True,
             timeout=10,
+            **_hidden_subprocess_kwargs(),
         )
         latest_sha = result.split()[0][:7] if result.strip() else current_sha
         return current_sha, latest_sha, ""

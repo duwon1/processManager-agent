@@ -29,6 +29,7 @@ async def self_update(agent_dir: str) -> tuple[bool, str]:
         capture_output=True,
         timeout=120,
         check=False,
+        **_hidden_subprocess_kwargs(),
     )
     if pull_result.returncode != 0:
         return False, _command_output(pull_result) or "git pull failed"
@@ -60,9 +61,12 @@ async def self_update(agent_dir: str) -> tuple[bool, str]:
         timeout=180,
         check=False,
         env=pip_env,
+        **_hidden_subprocess_kwargs(),
     )
     if pip_result.returncode != 0:
         return False, _command_output(pip_result) or "pip install failed"
+
+    _write_runner_script(target_dir)
 
     task_name = os.getenv("SERVICE_NAME", "ProcessManagerAgent").strip() or "ProcessManagerAgent"
     restart_script = _write_restart_script()
@@ -85,6 +89,41 @@ def _command_output(result: subprocess.CompletedProcess[str]) -> str:
     return ((result.stderr or "") + "\n" + (result.stdout or "")).strip()[-400:]
 
 
+def _hidden_subprocess_kwargs(detached: bool = False) -> dict:
+    kwargs = {}
+    creationflags = 0
+    if hasattr(subprocess, "CREATE_NO_WINDOW"):
+        creationflags |= subprocess.CREATE_NO_WINDOW
+    if detached and hasattr(subprocess, "DETACHED_PROCESS"):
+        creationflags |= subprocess.DETACHED_PROCESS
+    if creationflags:
+        kwargs["creationflags"] = creationflags
+
+    if hasattr(subprocess, "STARTUPINFO"):
+        startupinfo = subprocess.STARTUPINFO()
+        startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+        startupinfo.wShowWindow = 0
+        kwargs["startupinfo"] = startupinfo
+
+    return kwargs
+
+
+def _write_runner_script(agent_dir: Path) -> None:
+    runner_path = agent_dir / "run-agent.ps1"
+    script = r'''
+$ErrorActionPreference = "Stop"
+Set-Location -LiteralPath $PSScriptRoot
+$logDir = Join-Path $PSScriptRoot "logs"
+New-Item -ItemType Directory -Path $logDir -Force | Out-Null
+$logFile = Join-Path $logDir "agent.log"
+$python = Join-Path $PSScriptRoot ".venv\Scripts\python.exe"
+$env:PYTHONUNBUFFERED = "1"
+& $python main.py >> $logFile 2>&1
+exit $LASTEXITCODE
+'''
+    runner_path.write_text(textwrap.dedent(script).strip() + os.linesep, encoding="utf-8")
+
+
 def _start_detached_restart(script_path: Path, task_name: str) -> None:
     restart_task_name = f"ProcessManagerAgent-Restart-{uuid.uuid4().hex}"
     if _start_scheduled_restart(script_path, task_name, restart_task_name):
@@ -99,10 +138,6 @@ def _start_scheduled_restart(script_path: Path, task_name: str, restart_task_nam
     script is only a child of that task, it can be killed before Start-ScheduledTask
     runs. A temporary task avoids that self-kill path.
     """
-    creationflags = 0
-    if hasattr(subprocess, "CREATE_NO_WINDOW"):
-        creationflags |= subprocess.CREATE_NO_WINDOW
-
     register_script = f"""
 $ErrorActionPreference = "Stop"
 $taskName = {_ps_quote(task_name)}
@@ -124,18 +159,12 @@ Start-ScheduledTask -TaskName $restartTaskName
         timeout=15,
         check=False,
         stdin=subprocess.DEVNULL,
-        creationflags=creationflags,
+        **_hidden_subprocess_kwargs(),
     )
     return result.returncode == 0
 
 
 def _start_direct_restart(script_path: Path, task_name: str) -> None:
-    creationflags = 0
-    if hasattr(subprocess, "CREATE_NO_WINDOW"):
-        creationflags |= subprocess.CREATE_NO_WINDOW
-    if hasattr(subprocess, "DETACHED_PROCESS"):
-        creationflags |= subprocess.DETACHED_PROCESS
-
     subprocess.Popen(
         [
             "powershell.exe",
@@ -153,7 +182,7 @@ def _start_direct_restart(script_path: Path, task_name: str) -> None:
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
         close_fds=True,
-        creationflags=creationflags,
+        **_hidden_subprocess_kwargs(detached=True),
     )
 
 
