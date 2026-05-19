@@ -237,6 +237,15 @@ def _normalize_disk_type(value: Any, fallback: Any = None) -> str | None:
     return raw
 
 
+def _unique_text(values: list[Any]) -> list[str]:
+    result: list[str] = []
+    for value in values:
+        cleaned = _clean_text(value)
+        if cleaned and cleaned not in result:
+            result.append(cleaned)
+    return result
+
+
 def _collect_disk_inventory() -> list[dict[str, Any]]:
     script = r"""
 $physical = Get-PhysicalDisk -ErrorAction SilentlyContinue |
@@ -272,6 +281,19 @@ Get-CimInstance Win32_LogicalDisk -Filter 'DriveType=3' | ForEach-Object {
 }
 """
     return [row for row in _as_list(_run_powershell_json(script, timeout=10)) if isinstance(row, dict)]
+
+
+def _physical_disk_key(row: dict[str, Any]) -> str:
+    disk_index = _to_int(row.get("DiskIndex"))
+    if disk_index is not None:
+        return f"physicaldrive{disk_index}"
+
+    device_id = _clean_text(row.get("DiskDeviceId"))
+    if device_id:
+        return device_id.replace("\\\\.\\", "").lower()
+
+    logical = _clean_text(row.get("DeviceId"))
+    return (logical or "disk").lower()
 
 
 def _sample_disk_io(interval: float = 0.25) -> dict[str, tuple[int, int]]:
@@ -317,27 +339,42 @@ def _collect_disks() -> list[dict[str, Any]]:
     io_speeds = _sample_disk_io()
 
     if inventory:
+        grouped: dict[str, list[dict[str, Any]]] = {}
         for row in inventory:
-            device_id = _clean_text(row.get("DeviceId"))
-            mountpoint = f"{device_id}\\" if device_id else ""
-            total = _to_int(row.get("Size"))
-            free = _to_int(row.get("FreeSpace"))
-            used = (total - free) if total is not None and free is not None else None
+            grouped.setdefault(_physical_disk_key(row), []).append(row)
+
+        for rows in grouped.values():
+            total = sum(value for value in (_to_int(row.get("Size")) for row in rows) if value is not None)
+            free = sum(value for value in (_to_int(row.get("FreeSpace")) for row in rows) if value is not None)
+            used = total - free if total else None
             percent = round((used / total) * 100, 1) if total and used is not None else None
-            read_bps, write_bps = _disk_speed_for(row, io_speeds)
+
+            mountpoints = []
+            for row in rows:
+                device_id = _clean_text(row.get("DeviceId"))
+                if device_id:
+                    mountpoints.append(f"{device_id}\\")
+
+            representative = rows[0]
+            read_bps, write_bps = _disk_speed_for(representative, io_speeds)
+            disk_index = _to_int(representative.get("DiskIndex"))
+            physical_device = (
+                _clean_text(representative.get("DiskDeviceId"))
+                or (f"PhysicalDrive{disk_index}" if disk_index is not None else None)
+            )
 
             disks.append({
-                "mountpoint": mountpoint,
-                "device": mountpoint or device_id,
-                "fstype": _clean_text(row.get("FileSystem")),
-                "totalBytes": total,
+                "mountpoint": ", ".join(_unique_text(mountpoints)),
+                "device": physical_device or ", ".join(_unique_text([row.get("DeviceId") for row in rows])),
+                "fstype": ", ".join(_unique_text([row.get("FileSystem") for row in rows])),
+                "totalBytes": total or None,
                 "usedBytes": used,
-                "freeBytes": free,
+                "freeBytes": free if total else None,
                 "usagePercent": percent,
                 "readBytesPerSecond": read_bps,
                 "writeBytesPerSecond": write_bps,
-                "type": _normalize_disk_type(row.get("PhysicalMediaType"), row.get("BusType")),
-                "model": _clean_text(row.get("DiskModel")),
+                "type": _normalize_disk_type(representative.get("PhysicalMediaType"), representative.get("BusType")),
+                "model": _clean_text(representative.get("DiskModel")),
             })
         return disks
 

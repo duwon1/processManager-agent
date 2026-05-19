@@ -209,9 +209,46 @@ def _collect_memory() -> dict:
 
 # ── 디스크 (다중) ──────────────────────────────────────────────────────────
 
+_VIRTUAL_DISK_FSTYPES = {
+    "",
+    "tmpfs",
+    "devtmpfs",
+    "squashfs",
+    "overlay",
+    "proc",
+    "sysfs",
+    "cgroup",
+}
+
+
+def _unique_text(values: list[str]) -> list[str]:
+    result = []
+    for value in values:
+        if value and value not in result:
+            result.append(value)
+    return result
+
+
+def _block_name(device: str) -> str:
+    if not device:
+        return ""
+    return os.path.basename(os.path.realpath(device))
+
+
+def _parent_block_device(device: str) -> str:
+    name = _block_name(device)
+    if not name:
+        return ""
+
+    sys_block = f"/sys/class/block/{name}"
+    if os.path.exists(os.path.join(sys_block, "partition")):
+        return os.path.basename(os.path.dirname(os.path.realpath(sys_block)))
+    return name
+
+
 def _disk_type(device: str) -> str:
     try:
-        dev = re.sub(r"\d+$", "", device.split("/")[-1])
+        dev = _parent_block_device(device)
         path = f"/sys/block/{dev}/queue/rotational"
         if os.path.exists(path):
             with open(path, encoding="utf-8") as f:
@@ -224,7 +261,7 @@ def _disk_type(device: str) -> str:
 def _disk_model(device: str) -> str:
     """물리 디스크 제품명을 /sys/block에서 읽습니다."""
     try:
-        dev = re.sub(r"\d+$", "", device.split("/")[-1])
+        dev = _parent_block_device(device)
         model_path = f"/sys/block/{dev}/device/model"
         if os.path.exists(model_path):
             return open(model_path, encoding="utf-8").read().strip()
@@ -237,32 +274,57 @@ def _disk_model(device: str) -> str:
 
 
 def _collect_disks() -> list:
-    """마운트된 파티션 전체를 표준 숫자 필드로 수집합니다."""
-    results = []
+    """마운트된 파티션을 물리 블록 디바이스 기준으로 묶어 수집합니다."""
+    groups = {}
 
     io1 = psutil.disk_io_counters(perdisk=True) or {}
     time.sleep(0.5)
     io2 = psutil.disk_io_counters(perdisk=True) or {}
 
     for p in psutil.disk_partitions():
-        if p.fstype in ("", "tmpfs", "devtmpfs", "squashfs", "overlay", "proc", "sysfs", "cgroup"):
+        if p.fstype in _VIRTUAL_DISK_FSTYPES:
             continue
         try:
             usage = psutil.disk_usage(p.mountpoint)
         except Exception:
             continue
 
-        dev_name = re.sub(r"\d+$", "", p.device.split("/")[-1])
+        dev_name = _parent_block_device(p.device)
+        if not dev_name:
+            continue
+
+        group = groups.setdefault(dev_name, {
+            "mountpoints": [],
+            "devices": [],
+            "fstypes": [],
+            "countedDevices": set(),
+            "totalBytes": 0,
+            "usedBytes": 0,
+            "freeBytes": 0,
+        })
+        group["mountpoints"].append(p.mountpoint)
+        group["devices"].append(p.device)
+        group["fstypes"].append(p.fstype)
+        if p.device not in group["countedDevices"]:
+            group["countedDevices"].add(p.device)
+            group["totalBytes"] += usage.total
+            group["usedBytes"] += usage.used
+            group["freeBytes"] += usage.free
+
+    results = []
+    for dev_name, group in groups.items():
+        total = group["totalBytes"]
+        used = group["usedBytes"]
         entry = {
-            "mountpoint": p.mountpoint,
-            "device": p.device,
-            "fstype": p.fstype,
-            "totalBytes": usage.total,
-            "usedBytes": usage.used,
-            "freeBytes": usage.free,
-            "usagePercent": usage.percent,
-            "model": _disk_model(p.device),
-            "type": _disk_type(p.device),
+            "mountpoint": ", ".join(_unique_text(group["mountpoints"])),
+            "device": f"/dev/{dev_name}",
+            "fstype": ", ".join(_unique_text(group["fstypes"])),
+            "totalBytes": total,
+            "usedBytes": used,
+            "freeBytes": group["freeBytes"],
+            "usagePercent": round((used / total) * 100, 1) if total else None,
+            "model": _disk_model(dev_name),
+            "type": _disk_type(dev_name),
         }
 
         d1 = io1.get(dev_name)

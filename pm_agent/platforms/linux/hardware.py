@@ -33,7 +33,7 @@ def _section(key: str, items: list[dict[str, Any]], groups: list[dict[str, Any]]
 
 
 def _disk_groups(disks: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """마운트별 디스크 정보를 key-value 그룹으로 변환합니다."""
+    """물리 디스크별 정보를 key-value 그룹으로 변환합니다."""
     groups = []
     for index, disk in enumerate(disks):
         mountpoint = disk.get("mountpoint") or disk.get("device") or f"disk-{index + 1}"
