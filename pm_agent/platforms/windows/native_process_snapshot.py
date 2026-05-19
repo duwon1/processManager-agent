@@ -1,4 +1,4 @@
-"""Fast Windows process snapshots using NtQuerySystemInformation."""
+"""Fast Windows process snapshots backed by NtQuerySystemInformation."""
 from __future__ import annotations
 
 import ctypes
