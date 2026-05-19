@@ -8,6 +8,11 @@ from typing import Any
 
 import psutil
 
+try:
+    from pm_agent.platforms.windows import native_process_snapshot
+except Exception:
+    native_process_snapshot = None
+
 
 CPU_COUNT = psutil.cpu_count() or 1
 CPU_SAMPLE_INTERVAL = 0.1
@@ -15,6 +20,7 @@ MAX_CMDLINE_LENGTH = 160
 MAX_EXE_LENGTH = 120
 
 _io_cache: dict[int, tuple[float, float, float]] = {}
+_native_fallback_reported = False
 
 
 def _normalize_status(status: str | None) -> str:
@@ -88,7 +94,7 @@ def _prime_cpu_percent(processes: list[psutil.Process]) -> None:
     time.sleep(CPU_SAMPLE_INTERVAL)
 
 
-def list_processes() -> list[dict[str, Any]]:
+def _list_processes_psutil() -> list[dict[str, Any]]:
     attrs = [
         "pid",
         "name",
@@ -147,6 +153,18 @@ def list_processes() -> list[dict[str, Any]]:
         key=lambda item: (item["cpu_percent"], item["memory_bytes"]),
         reverse=True,
     )
+
+
+def list_processes() -> list[dict[str, Any]]:
+    global _native_fallback_reported
+    if native_process_snapshot is not None:
+        try:
+            return native_process_snapshot.list_processes()
+        except Exception as exc:
+            if not _native_fallback_reported:
+                print(f"[에이전트] Windows 네이티브 프로세스 수집 실패, psutil로 전환: {exc}")
+                _native_fallback_reported = True
+    return _list_processes_psutil()
 
 
 def kill_process(pid: int) -> str:

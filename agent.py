@@ -16,6 +16,7 @@ from stomp import stomp_frame, extract_stomp_body, extract_stomp_destination
 COMMAND_SUBSCRIPTION_ID = "agent-command-channel"
 SYSINFO_SUBSCRIPTION_ID = "sysinfo-request-channel"
 UPDATE_CHECK_INTERVAL_SECONDS = 10 * 60
+PROCESS_SEND_INTERVAL_SECONDS = 2
 
 
 class _AgentShutdown(Exception):
@@ -211,13 +212,15 @@ async def run_agent(
                 async def send_process_loop():
                     """프로세스 목록을 2초 간격으로 전송합니다."""
                     while True:
+                        started_at = asyncio.get_running_loop().time()
                         data = platform_adapter.list_processes()
                         await websocket.send(stomp_frame(
                             "SEND",
                             {"destination": "/app/process", "content-type": "application/json"},
                             json.dumps(data),
                         ))
-                        await asyncio.sleep(2)
+                        elapsed = asyncio.get_running_loop().time() - started_at
+                        await asyncio.sleep(max(0, PROCESS_SEND_INTERVAL_SECONDS - elapsed))
 
                 async def send_service_loop():
                     """서비스 목록을 10초 간격으로 전송합니다."""
