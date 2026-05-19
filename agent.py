@@ -52,6 +52,19 @@ def get_git_revisions(agent_dir: str) -> tuple[str, str, str]:
         return current_sha, current_sha, str(exc)
 
 
+def _targets_this_agent(payload: dict, destination: str, agent_id: str, hostname: str) -> bool:
+    """Prefer agentId routing; keep nodeName only as a legacy broadcast fallback."""
+    target_agent_id = str(payload.get("agentId", "") or "").strip()
+    if target_agent_id:
+        return target_agent_id == agent_id
+
+    if agent_id and destination.endswith(f".{agent_id}"):
+        return True
+
+    target_node_name = str(payload.get("nodeName", "") or "").strip()
+    return bool(target_node_name and target_node_name == hostname)
+
+
 async def run_agent(
     url: str,
     account_token: str,
@@ -291,57 +304,58 @@ async def run_agent(
 
                         # ── 시스템 정보 수집 요청 ──
                         if destination in ("/topic/agent.sysinfo-request", f"/topic/agent.sysinfo-request.{agent_id}"):
-                            if payload.get("nodeName") == hostname:
-                                try:
-                                    loop = asyncio.get_event_loop()
-                                    info = await loop.run_in_executor(None, platform_adapter.collect_hardware)
-                                    info["nodeId"] = payload.get("nodeId")
-                                    await websocket.send(stomp_frame(
-                                        "SEND",
-                                        {"destination": "/app/system-info", "content-type": "application/json"},
-                                        json.dumps(info),
-                                    ))
-                                    print("[에이전트] 시스템 정보 전송 완료")
-                                except Exception as e:
-                                    print(f"[에이전트] 시스템 정보 수집 오류: {e}")
+                            if not _targets_this_agent(payload, destination, agent_id, hostname):
+                                continue
+                            try:
+                                loop = asyncio.get_event_loop()
+                                info = await loop.run_in_executor(None, platform_adapter.collect_hardware)
+                                info["nodeId"] = payload.get("nodeId")
+                                await websocket.send(stomp_frame(
+                                    "SEND",
+                                    {"destination": "/app/system-info", "content-type": "application/json"},
+                                    json.dumps(info),
+                                ))
+                                print("[에이전트] 시스템 정보 전송 완료")
+                            except Exception as e:
+                                print(f"[에이전트] 시스템 정보 수집 오류: {e}")
+                            continue
+
+                        if not _targets_this_agent(payload, destination, agent_id, hostname):
                             continue
 
                         cmd_type = payload.get("type", "")
 
                         if cmd_type == "agent-secret":
-                            if payload.get("nodeName") == hostname and payload.get("agentId") == agent_id:
-                                new_secret = str(payload.get("agentSecret", "")).strip()
-                                if new_secret:
-                                    # 서버가 발급한 노드 전용 secret을 저장하고 1회용 설치 토큰은 로컬에서 비웁니다.
-                                    env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
-                                    lines = []
-                                    found_secret = False
-                                    found_account_token = False
-                                    if os.path.exists(env_path):
-                                        with open(env_path, "r", encoding="utf-8") as fh:
-                                            for line in fh.read().splitlines():
-                                                if line.startswith("AGENT_SECRET="):
-                                                    lines.append(f"AGENT_SECRET={new_secret}")
-                                                    found_secret = True
-                                                elif line.startswith("ACCOUNT_TOKEN="):
-                                                    lines.append("ACCOUNT_TOKEN=")
-                                                    found_account_token = True
-                                                else:
-                                                    lines.append(line)
-                                    if not found_account_token:
-                                        lines.insert(0, "ACCOUNT_TOKEN=")
-                                    if not found_secret:
-                                        lines.append(f"AGENT_SECRET={new_secret}")
-                                    with open(env_path, "w", encoding="utf-8") as fh:
-                                        fh.write("\n".join(lines) + "\n")
-                                    agent_secret = new_secret
-                                    print("[agent] agent secret saved")
+                            new_secret = str(payload.get("agentSecret", "")).strip()
+                            if new_secret:
+                                # 서버가 발급한 노드 전용 secret을 저장하고 1회용 설치 토큰은 로컬에서 비웁니다.
+                                env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
+                                lines = []
+                                found_secret = False
+                                found_account_token = False
+                                if os.path.exists(env_path):
+                                    with open(env_path, "r", encoding="utf-8") as fh:
+                                        for line in fh.read().splitlines():
+                                            if line.startswith("AGENT_SECRET="):
+                                                lines.append(f"AGENT_SECRET={new_secret}")
+                                                found_secret = True
+                                            elif line.startswith("ACCOUNT_TOKEN="):
+                                                lines.append("ACCOUNT_TOKEN=")
+                                                found_account_token = True
+                                            else:
+                                                lines.append(line)
+                                if not found_account_token:
+                                    lines.insert(0, "ACCOUNT_TOKEN=")
+                                if not found_secret:
+                                    lines.append(f"AGENT_SECRET={new_secret}")
+                                with open(env_path, "w", encoding="utf-8") as fh:
+                                    fh.write("\n".join(lines) + "\n")
+                                agent_secret = new_secret
+                                print("[agent] agent secret saved")
                             continue
 
                         # ── 서비스 제어 명령 ──
                         if cmd_type == "service-control":
-                            if payload.get("nodeName") != hostname:
-                                continue
                             svc_name = payload.get("name", "")
                             action = payload.get("action", "")
                             try:
@@ -359,14 +373,13 @@ async def run_agent(
                                     "success": success,
                                     "message": message,
                                     "nodeName": hostname,
+                                    "agentId": agent_id,
                                 }),
                             ))
                             continue
 
                         # ── 파일 목록 요청 처리 ──
                         if cmd_type == "file-list":
-                            if payload.get("nodeName") != hostname:
-                                continue
                             try:
                                 response = platform_adapter.list_files(str(payload.get("path", "") or ""))
                             except Exception as e:
@@ -386,14 +399,6 @@ async def run_agent(
 
                         # ── 업데이트 명령 처리 ──
                         if cmd_type in ("update", "update-check"):
-                            target_agent_id = str(payload.get("agentId", "") or "").strip()
-                            target_node_name = str(payload.get("nodeName", "") or "").strip()
-                            if target_agent_id:
-                                if target_agent_id != agent_id:
-                                    continue
-                            elif target_node_name != hostname:
-                                continue
-
                             print("[agent] update check command received")
                             try:
                                 await check_and_apply_update("manual")
@@ -411,32 +416,29 @@ async def run_agent(
 
                         # Uninstall command handling
                         if cmd_type == "uninstall":
-                            if payload.get("nodeName") == hostname:
-                                print("[agent] uninstall command received; starting self-removal")
-                                agent_dir = os.path.dirname(os.path.abspath(__file__))
-                                platform_adapter.start_self_uninstall(agent_dir, service_name)
-                                await websocket.send(stomp_frame(
-                                    "SEND",
-                                    {"destination": "/app/agent.uninstall-ack", "content-type": "application/json"},
-                                    json.dumps({
-                                        "nodeName": hostname,
-                                        "serviceName": service_name,
-                                        "stage": "started",
-                                    }),
-                                ))
-                                print("[agent] uninstall ack sent")
-                                raise _AgentShutdown("uninstall")
+                            print("[agent] uninstall command received; starting self-removal")
+                            agent_dir = os.path.dirname(os.path.abspath(__file__))
+                            platform_adapter.start_self_uninstall(agent_dir, service_name)
+                            await websocket.send(stomp_frame(
+                                "SEND",
+                                {"destination": "/app/agent.uninstall-ack", "content-type": "application/json"},
+                                json.dumps({
+                                    "nodeName": hostname,
+                                    "agentId": agent_id,
+                                    "serviceName": service_name,
+                                    "stage": "started",
+                                }),
+                            ))
+                            print("[agent] uninstall ack sent")
+                            raise _AgentShutdown("uninstall")
                             continue
 
                         # Terminal command handling
                         if cmd_type.startswith("terminal-"):
-                            _handle_terminal_command(payload, cmd_type, hostname, platform_adapter)
+                            _handle_terminal_command(payload, cmd_type, platform_adapter)
                             continue
 
                         # ── kill 명령 처리 ──
-                        if payload.get("nodeName") != hostname:
-                            continue
-
                         pid = int(payload.get("pid", 0))
                         request_id = str(payload.get("requestId", "")).strip()
                         if not request_id or pid <= 0:
@@ -461,6 +463,7 @@ async def run_agent(
                                 "success": success,
                                 "message": message,
                                 "nodeName": hostname,
+                                "agentId": agent_id,
                             }),
                         ))
 
@@ -495,11 +498,8 @@ async def run_agent(
             await asyncio.sleep(5)
 
 
-def _handle_terminal_command(payload: dict, cmd_type: str, hostname: str, platform_adapter) -> None:
+def _handle_terminal_command(payload: dict, cmd_type: str, platform_adapter) -> None:
     """터미널 관련 명령을 분기 처리합니다."""
-    if payload.get("nodeName") and payload.get("nodeName") != hostname:
-        return
-
     session_id = payload.get("sessionId", "")
 
     if cmd_type == "terminal-open":
