@@ -21,6 +21,11 @@ try:
 except Exception:
     native_memory_perf = None
 
+try:
+    from pm_agent.platforms.windows import hardware as hardware_info
+except Exception:
+    hardware_info = None
+
 METRIC_DEFINITIONS = {
     1: ("cpu.usagePercent", "percent"),
     2: ("gpu.usagePercent", "percent"),
@@ -36,6 +41,7 @@ METRIC_DEFINITIONS = {
     12: ("disk.readBytesPerSecond", "bytesPerSecond"),
     13: ("disk.writeBytesPerSecond", "bytesPerSecond"),
     14: ("memory.hardware", "object"),
+    15: ("disk.devices", "object"),
 }
 
 _last_net_sent: int
@@ -48,10 +54,13 @@ _last_memory_perf: dict[str, int] = {}
 _last_memory_perf_time = 0.0
 _last_memory_hardware: dict[str, Any] | None = None
 _last_memory_hardware_time = 0.0
+_last_disk_inventory: list[dict[str, Any]] = []
+_last_disk_inventory_time = 0.0
 
 GPU_USAGE_CACHE_SECONDS = 1
 POWERSHELL_CACHE_SECONDS = 10
 MEMORY_HARDWARE_CACHE_SECONDS = 60
+DISK_INVENTORY_CACHE_SECONDS = 60
 
 
 def _metric(metric_id: int, value: Any) -> dict[str, Any]:
@@ -63,7 +72,7 @@ def _metric(metric_id: int, value: Any) -> dict[str, Any]:
         "value": value,
         "rawValue": value,
         "unit": unit,
-        "valueType": "number" if isinstance(value, (int, float)) else "object" if isinstance(value, dict) else "text",
+        "valueType": "number" if isinstance(value, (int, float)) else "object" if isinstance(value, (dict, list)) else "text",
     }
 
 
@@ -241,6 +250,81 @@ def _get_memory_hardware() -> dict[str, Any] | None:
     return _last_memory_hardware
 
 
+def _get_disk_inventory() -> list[dict[str, Any]]:
+    global _last_disk_inventory, _last_disk_inventory_time
+
+    now = time.time()
+    if now - _last_disk_inventory_time < DISK_INVENTORY_CACHE_SECONDS:
+        return _last_disk_inventory
+
+    if hardware_info is None:
+        _last_disk_inventory = []
+    else:
+        _last_disk_inventory = hardware_info._collect_disk_inventory()
+    _last_disk_inventory_time = now
+    return _last_disk_inventory
+
+
+def _get_disk_devices() -> list[dict[str, Any]]:
+    if hardware_info is None:
+        try:
+            usage = psutil.disk_usage(_get_system_disk_path())
+            return [{
+                "mountpoint": _get_system_disk_path(),
+                "partitions": _get_system_disk_path(),
+                "device": _get_system_disk_path(),
+                "totalBytes": usage.total,
+                "usedBytes": usage.used,
+                "freeBytes": usage.free,
+                "usagePercent": round(usage.percent, 1),
+            }]
+        except Exception:
+            return []
+
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    for row in _get_disk_inventory():
+        grouped.setdefault(hardware_info._physical_disk_key(row), []).append(row)
+
+    disks: list[dict[str, Any]] = []
+    for rows in grouped.values():
+        total = used = free = 0
+        mountpoints: list[str] = []
+        for row in rows:
+            device_id = hardware_info._clean_text(row.get("DeviceId"))
+            if not device_id:
+                continue
+            mountpoint = f"{device_id}\\"
+            try:
+                usage = psutil.disk_usage(mountpoint)
+            except Exception:
+                continue
+            mountpoints.append(mountpoint)
+            total += usage.total
+            used += usage.used
+            free += usage.free
+
+        if not total:
+            continue
+
+        representative = rows[0]
+        disk_index = hardware_info._to_int(representative.get("DiskIndex"))
+        physical_device = (
+            hardware_info._clean_text(representative.get("DiskDeviceId"))
+            or (f"PhysicalDrive{disk_index}" if disk_index is not None else None)
+        )
+        disks.append({
+            "mountpoint": ", ".join(hardware_info._unique_text(mountpoints)),
+            "partitions": ", ".join(hardware_info._unique_text(mountpoints)),
+            "device": physical_device or ", ".join(hardware_info._unique_text([row.get("DeviceId") for row in rows])),
+            "totalBytes": total,
+            "usedBytes": used,
+            "freeBytes": free,
+            "usagePercent": round((used / total) * 100, 1),
+        })
+
+    return disks
+
+
 def collect_metrics() -> list[dict[str, Any]]:
     """Collect Windows metrics using the same payload shape as Linux."""
     global _last_net_sent, _last_net_recv, _last_time, _last_disk_io
@@ -293,6 +377,7 @@ def collect_metrics() -> list[dict[str, Any]]:
         _metric(12, disk_read_bps),
         _metric(13, disk_write_bps),
         _metric(14, _get_memory_hardware()),
+        _metric(15, _get_disk_devices()),
     ]
 
 

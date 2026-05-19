@@ -315,8 +315,10 @@ def _collect_disks() -> list:
     for dev_name, group in groups.items():
         total = group["totalBytes"]
         used = group["usedBytes"]
+        partitions = ", ".join(_unique_text(group["mountpoints"]))
         entry = {
-            "mountpoint": ", ".join(_unique_text(group["mountpoints"])),
+            "mountpoint": partitions,
+            "partitions": partitions,
             "device": f"/dev/{dev_name}",
             "fstype": ", ".join(_unique_text(group["fstypes"])),
             "totalBytes": total,

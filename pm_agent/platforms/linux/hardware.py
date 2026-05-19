@@ -42,6 +42,7 @@ def _disk_groups(disks: list[dict[str, Any]]) -> list[dict[str, Any]]:
             "titleValue": mountpoint,
             "items": [
                 _item("mountpoint", disk.get("mountpoint")),
+                _item("partitions", disk.get("partitions")),
                 _item("device", disk.get("device")),
                 _item("filesystem", disk.get("fstype")),
                 _item("totalBytes", disk.get("totalBytes"), "bytes"),
@@ -119,6 +120,7 @@ def _summary(legacy: dict[str, Any]) -> dict[str, Any]:
         "disks": [
             {
                 "mountpoint": disk.get("mountpoint"),
+                "partitions": disk.get("partitions"),
                 "device": disk.get("device"),
                 "totalBytes": disk.get("totalBytes"),
                 "usedBytes": disk.get("usedBytes"),

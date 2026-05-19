@@ -354,6 +354,7 @@ def _collect_disks() -> list[dict[str, Any]]:
                 device_id = _clean_text(row.get("DeviceId"))
                 if device_id:
                     mountpoints.append(f"{device_id}\\")
+            partitions = ", ".join(_unique_text(mountpoints))
 
             representative = rows[0]
             read_bps, write_bps = _disk_speed_for(representative, io_speeds)
@@ -364,7 +365,8 @@ def _collect_disks() -> list[dict[str, Any]]:
             )
 
             disks.append({
-                "mountpoint": ", ".join(_unique_text(mountpoints)),
+                "mountpoint": partitions,
+                "partitions": partitions,
                 "device": physical_device or ", ".join(_unique_text([row.get("DeviceId") for row in rows])),
                 "fstype": ", ".join(_unique_text([row.get("FileSystem") for row in rows])),
                 "totalBytes": total or None,
@@ -387,6 +389,7 @@ def _collect_disks() -> list[dict[str, Any]]:
         read_bps, write_bps = _disk_speed_for({"DeviceId": partition.device.rstrip("\\")}, io_speeds)
         disks.append({
             "mountpoint": partition.mountpoint,
+            "partitions": partition.mountpoint,
             "device": partition.device,
             "fstype": partition.fstype,
             "totalBytes": usage.total,
@@ -591,6 +594,7 @@ def _disk_groups(disks: list[dict[str, Any]]) -> list[dict[str, Any]]:
             "titleValue": title,
             "items": [
                 _item("mountpoint", disk.get("mountpoint")),
+                _item("partitions", disk.get("partitions")),
                 _item("device", disk.get("device")),
                 _item("filesystem", disk.get("fstype")),
                 _item("totalBytes", disk.get("totalBytes"), "bytes"),
@@ -712,6 +716,7 @@ def collect_hardware() -> dict[str, Any]:
             "disks": [
                 {
                     "mountpoint": disk.get("mountpoint"),
+                    "partitions": disk.get("partitions"),
                     "device": disk.get("device"),
                     "model": disk.get("model"),
                     "type": disk.get("type"),

@@ -12,6 +12,8 @@ from typing import Any
 import psutil
 from fastapi import APIRouter
 
+from system import hardware as hardware_info
+
 router = APIRouter()
 
 METRIC_DEFINITIONS = {
@@ -29,6 +31,7 @@ METRIC_DEFINITIONS = {
     12: ("disk.readBytesPerSecond", "bytesPerSecond"),
     13: ("disk.writeBytesPerSecond", "bytesPerSecond"),
     14: ("memory.hardware", "object"),
+    15: ("disk.devices", "object"),
 }
 
 # ── GPU 사용률 ──────────────────────────────────────────────────────────────
@@ -173,8 +176,54 @@ def _metric(metric_id: int, value: Any) -> dict[str, Any]:
         "value": value,
         "rawValue": value,
         "unit": unit,
-        "valueType": "number" if isinstance(value, (int, float)) else "object" if isinstance(value, dict) else "text",
+        "valueType": "number" if isinstance(value, (int, float)) else "object" if isinstance(value, (dict, list)) else "text",
     }
+
+
+def _collect_disk_devices() -> list[dict[str, Any]]:
+    groups: dict[str, dict[str, Any]] = {}
+    for partition in psutil.disk_partitions():
+        if partition.fstype in hardware_info._VIRTUAL_DISK_FSTYPES:
+            continue
+        dev_name = hardware_info._parent_block_device(partition.device)
+        if not dev_name:
+            continue
+        try:
+            usage = psutil.disk_usage(partition.mountpoint)
+        except Exception:
+            continue
+
+        group = groups.setdefault(dev_name, {
+            "mountpoints": [],
+            "totalBytes": 0,
+            "usedBytes": 0,
+            "freeBytes": 0,
+            "countedDevices": set(),
+        })
+        group["mountpoints"].append(partition.mountpoint)
+        if partition.device not in group["countedDevices"]:
+            group["countedDevices"].add(partition.device)
+            group["totalBytes"] += usage.total
+            group["usedBytes"] += usage.used
+            group["freeBytes"] += usage.free
+
+    disks = []
+    for dev_name, group in groups.items():
+        total = group["totalBytes"]
+        used = group["usedBytes"]
+        if not total:
+            continue
+        partitions = ", ".join(hardware_info._unique_text(group["mountpoints"]))
+        disks.append({
+            "mountpoint": partitions,
+            "partitions": partitions,
+            "device": f"/dev/{dev_name}",
+            "totalBytes": total,
+            "usedBytes": used,
+            "freeBytes": group["freeBytes"],
+            "usagePercent": round((used / total) * 100, 1),
+        })
+    return disks
 
 
 # ── 메트릭 수집 ──────────────────────────────────────────────────────────────
@@ -223,6 +272,7 @@ def collect_system_metrics() -> list[dict[str, Any]]:
         _metric(12, disk_read_bps),
         _metric(13, disk_write_bps),
         _metric(14, _get_memory_hardware()),
+        _metric(15, _collect_disk_devices()),
     ]
 
 
