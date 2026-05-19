@@ -15,7 +15,7 @@ from stomp import stomp_frame, extract_stomp_body, extract_stomp_destination
 
 COMMAND_SUBSCRIPTION_ID = "agent-command-channel"
 SYSINFO_SUBSCRIPTION_ID = "sysinfo-request-channel"
-UPDATE_CHECK_INTERVAL_SECONDS = 10 * 60
+UPDATE_CHECK_INTERVAL_SECONDS = 60
 PROCESS_SEND_INTERVAL_SECONDS = 2
 
 
