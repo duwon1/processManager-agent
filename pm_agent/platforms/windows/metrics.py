@@ -11,6 +11,16 @@ from typing import Any
 
 import psutil
 
+try:
+    from pm_agent.platforms.windows import native_gpu_usage
+except Exception:
+    native_gpu_usage = None
+
+try:
+    from pm_agent.platforms.windows import native_memory_perf
+except Exception:
+    native_memory_perf = None
+
 METRIC_DEFINITIONS = {
     1: ("cpu.usagePercent", "percent"),
     2: ("gpu.usagePercent", "percent"),
@@ -39,6 +49,7 @@ _last_memory_perf_time = 0.0
 _last_memory_hardware: dict[str, Any] | None = None
 _last_memory_hardware_time = 0.0
 
+GPU_USAGE_CACHE_SECONDS = 1
 POWERSHELL_CACHE_SECONDS = 10
 MEMORY_HARDWARE_CACHE_SECONDS = 60
 
@@ -140,23 +151,15 @@ def _get_gpu_usage() -> float | None:
     global _last_gpu_usage_value, _last_gpu_usage_time
 
     now = time.time()
-    if now - _last_gpu_usage_time < POWERSHELL_CACHE_SECONDS:
+    if now - _last_gpu_usage_time < GPU_USAGE_CACHE_SECONDS:
         return _last_gpu_usage_value
 
-    data = _run_powershell_json(
-        "$samples = (Get-Counter '\\GPU Engine(*)\\Utilization Percentage' -ErrorAction SilentlyContinue).CounterSamples; "
-        "$value = ($samples | Measure-Object -Property CookedValue -Sum).Sum; "
-        "if ($null -eq $value) { $value = 0 }; "
-        "[pscustomobject]@{Usage=[Math]::Round([Math]::Min([double]$value, 100), 1)}",
-        timeout=5,
-    )
-    if isinstance(data, dict) and data.get("Usage") is not None:
-        try:
-            _last_gpu_usage_value = max(0.0, min(float(data["Usage"]), 100.0))
+    if native_gpu_usage is not None:
+        value = native_gpu_usage.read_usage_percent()
+        if value is not None:
+            _last_gpu_usage_value = value
             _last_gpu_usage_time = now
             return _last_gpu_usage_value
-        except (TypeError, ValueError):
-            pass
 
     try:
         import GPUtil
@@ -180,20 +183,7 @@ def _get_memory_perf() -> dict[str, int]:
     if now - _last_memory_perf_time < POWERSHELL_CACHE_SECONDS:
         return _last_memory_perf
 
-    data = _run_powershell_json(
-        "Get-CimInstance Win32_PerfRawData_PerfOS_Memory | "
-        "Select-Object CacheBytes,CommittedBytes,CommitLimit",
-        timeout=5,
-    )
-    next_perf: dict[str, int] = {}
-    if isinstance(data, dict):
-        for key in ("CacheBytes", "CommittedBytes", "CommitLimit"):
-            try:
-                value = data.get(key)
-                if value is not None:
-                    next_perf[key] = int(value)
-            except (TypeError, ValueError):
-                continue
+    next_perf = native_memory_perf.read_memory_perf() if native_memory_perf is not None else {}
 
     _last_memory_perf = next_perf
     _last_memory_perf_time = now
