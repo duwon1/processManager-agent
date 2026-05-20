@@ -16,6 +16,18 @@ PDH_GPU_DEDICATED_MEMORY_COUNTER = r"\GPU Adapter Memory(*)\Dedicated Usage"
 PDH_GPU_SHARED_MEMORY_COUNTER = r"\GPU Adapter Memory(*)\Shared Usage"
 
 
+def _gpu_engine_key(instance_name: str | None) -> str | None:
+    if not instance_name:
+        return None
+
+    name = instance_name.lower()
+    if name.startswith("pid_"):
+        parts = name.split("_", 2)
+        if len(parts) == 3:
+            return parts[2]
+    return name
+
+
 class _PDH_FMT_COUNTERVALUE_UNION(ctypes.Union):
     _fields_ = [
         ("longValue", wintypes.LONG),
@@ -159,16 +171,18 @@ class PdhGpuUsageSampler:
 
         items_type = PDH_FMT_COUNTERVALUE_ITEM_W * item_count.value
         items = ctypes.cast(buffer, ctypes.POINTER(items_type)).contents
-        peak = 0.0
-        found = False
+        engine_totals: dict[str, float] = {}
         for item in items:
             if item.FmtValue.CStatus not in (ERROR_SUCCESS, 1):
                 continue
-            peak = max(peak, max(0.0, float(item.FmtValue.doubleValue)))
-            found = True
+            key = _gpu_engine_key(item.szName)
+            if not key:
+                continue
+            engine_totals[key] = engine_totals.get(key, 0.0) + max(0.0, float(item.FmtValue.doubleValue))
 
-        if not found:
+        if not engine_totals:
             return None
+        peak = max(min(value, 100.0) for value in engine_totals.values())
         return round(min(peak, 100.0), 1)
 
 

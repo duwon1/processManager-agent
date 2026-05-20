@@ -680,9 +680,15 @@ def _read_gpu_counters() -> dict[str, Any]:
     data = _run_powershell_json(
         "$dedicated = @(Get-Counter '\\GPU Adapter Memory(*)\\Dedicated Usage' -ErrorAction SilentlyContinue).CounterSamples | Select-Object Path,CookedValue; "
         "$shared = @(Get-Counter '\\GPU Adapter Memory(*)\\Shared Usage' -ErrorAction SilentlyContinue).CounterSamples | Select-Object Path,CookedValue; "
-        "$samples = (Get-Counter '\\GPU Engine(*)\\Utilization Percentage' -ErrorAction SilentlyContinue).CounterSamples; "
-        "$value = ($samples | Measure-Object -Property CookedValue -Maximum).Maximum; "
-        "if ($null -eq $value) { $value = 0 }; "
+        "$samples = @(Get-Counter '\\GPU Engine(*)\\Utilization Percentage' -ErrorAction SilentlyContinue).CounterSamples; "
+        "$groups = @{}; "
+        "foreach ($sample in $samples) { "
+        "$key = ([string]$sample.InstanceName).ToLower() -replace '^pid_[^_]+_', ''; "
+        "if (-not $groups.ContainsKey($key)) { $groups[$key] = 0.0 }; "
+        "$groups[$key] += [Math]::Max(0.0, [double]$sample.CookedValue) "
+        "}; "
+        "$value = 0.0; "
+        "foreach ($entry in $groups.GetEnumerator()) { $value = [Math]::Max($value, [Math]::Min([double]$entry.Value, 100.0)) }; "
         "[pscustomobject]@{Dedicated=$dedicated; Shared=$shared; Usage=[Math]::Round([Math]::Min([double]$value, 100), 1)}",
         timeout=8,
     )
