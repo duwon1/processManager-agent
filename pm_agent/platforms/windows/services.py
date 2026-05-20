@@ -136,7 +136,25 @@ def _run_powershell(command: str, timeout: int, env: dict[str, str] | None = Non
         errors="replace",
         timeout=timeout,
         env=env,
+        **_hidden_subprocess_kwargs(),
     )
+
+
+def _hidden_subprocess_kwargs() -> dict[str, Any]:
+    kwargs: dict[str, Any] = {}
+    creationflags = 0
+    if hasattr(subprocess, "CREATE_NO_WINDOW"):
+        creationflags |= subprocess.CREATE_NO_WINDOW
+    if creationflags:
+        kwargs["creationflags"] = creationflags
+
+    if hasattr(subprocess, "STARTUPINFO"):
+        startupinfo = subprocess.STARTUPINFO()
+        startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+        startupinfo.wShowWindow = 0
+        kwargs["startupinfo"] = startupinfo
+
+    return kwargs
 
 
 def _map_service_state(state: str, status: str) -> tuple[str, str]:
