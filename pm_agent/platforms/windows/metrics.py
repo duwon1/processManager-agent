@@ -17,6 +17,11 @@ except Exception:
     native_gpu_usage = None
 
 try:
+    from pm_agent.platforms.windows import native_disk_usage
+except Exception:
+    native_disk_usage = None
+
+try:
     from pm_agent.platforms.windows import native_memory_perf
 except Exception:
     native_memory_perf = None
@@ -47,7 +52,13 @@ METRIC_DEFINITIONS = {
 _last_net_sent: int
 _last_net_recv: int
 _last_time: float
-_last_disk_io = psutil.disk_io_counters()
+_last_disk_io = psutil.disk_io_counters(perdisk=True) or {}
+_last_disk_io_time = time.time()
+_last_disk_speed_time = 0.0
+_last_disk_read_bps: int | None = None
+_last_disk_write_bps: int | None = None
+_last_disk_speeds: dict[str, tuple[int, int]] = {}
+_last_disk_active: dict[str, float] = {}
 _last_gpu_usage_value: float | None = None
 _last_gpu_usage_time = 0.0
 _last_memory_perf: dict[str, int] = {}
@@ -61,6 +72,7 @@ GPU_USAGE_CACHE_SECONDS = 1
 POWERSHELL_CACHE_SECONDS = 10
 MEMORY_HARDWARE_CACHE_SECONDS = 60
 DISK_INVENTORY_CACHE_SECONDS = 60
+DISK_IO_CACHE_SECONDS = 0.5
 
 
 def _metric(metric_id: int, value: Any) -> dict[str, Any]:
@@ -154,6 +166,93 @@ def _to_int(value: Any) -> int | None:
         return int(float(value))
     except (TypeError, ValueError):
         return None
+
+
+def _to_float(value: Any) -> float | None:
+    try:
+        if value is None or str(value).strip() == "":
+            return None
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _disk_io_key(name: Any) -> str:
+    return str(name or "").replace("\\\\.\\", "").lower()
+
+
+def _get_native_disk_io() -> tuple[int | None, int | None, dict[str, tuple[int, int]], dict[str, float]] | None:
+    if native_disk_usage is None:
+        return None
+
+    rows = native_disk_usage.read_disk_counters()
+    if not rows:
+        return None
+
+    speeds: dict[str, tuple[int, int]] = {}
+    active: dict[str, float] = {}
+    total_read = 0
+    total_write = 0
+    for key, values in rows.items():
+        read_bps = int(max(0.0, float(values.get("readBytesPerSecond") or 0.0)))
+        write_bps = int(max(0.0, float(values.get("writeBytesPerSecond") or 0.0)))
+        active_percent = values.get("activeTimePercent")
+        speeds[key] = (read_bps, write_bps)
+        if active_percent is not None:
+            active[key] = max(0.0, min(float(active_percent), 100.0))
+        total_read += read_bps
+        total_write += write_bps
+
+    return total_read, total_write, speeds, active
+
+
+def _get_disk_io_speeds(now: float | None = None) -> tuple[int | None, int | None, dict[str, tuple[int, int]], dict[str, float]]:
+    global _last_disk_io, _last_disk_io_time, _last_disk_speed_time
+    global _last_disk_read_bps, _last_disk_write_bps, _last_disk_speeds, _last_disk_active
+
+    current_time = now or time.time()
+    if current_time - _last_disk_speed_time < DISK_IO_CACHE_SECONDS:
+        return _last_disk_read_bps, _last_disk_write_bps, _last_disk_speeds, _last_disk_active
+
+    native_sample = _get_native_disk_io()
+    if native_sample is not None:
+        _last_disk_read_bps, _last_disk_write_bps, _last_disk_speeds, _last_disk_active = native_sample
+        _last_disk_speed_time = current_time
+        _last_disk_io_time = current_time
+        return native_sample
+
+    current = psutil.disk_io_counters(perdisk=True) or {}
+    elapsed = max(current_time - _last_disk_io_time, 0.001)
+    elapsed_ms = elapsed * 1000
+    speeds: dict[str, tuple[int, int]] = {}
+    active: dict[str, float] = {}
+    total_read = 0
+    total_write = 0
+    has_sample = False
+
+    for name, after in current.items():
+        before = _last_disk_io.get(name)
+        if before is None:
+            continue
+        read_bps = int(max(0, (after.read_bytes - before.read_bytes) / elapsed))
+        write_bps = int(max(0, (after.write_bytes - before.write_bytes) / elapsed))
+        key = _disk_io_key(name)
+        read_ms = max(0, getattr(after, "read_time", 0) - getattr(before, "read_time", 0))
+        write_ms = max(0, getattr(after, "write_time", 0) - getattr(before, "write_time", 0))
+        speeds[key] = (read_bps, write_bps)
+        active[key] = round(min(((read_ms + write_ms) / elapsed_ms) * 100, 100.0), 1)
+        total_read += read_bps
+        total_write += write_bps
+        has_sample = True
+
+    _last_disk_io = current
+    _last_disk_io_time = current_time
+    _last_disk_speed_time = current_time
+    _last_disk_speeds = speeds
+    _last_disk_active = active
+    _last_disk_read_bps = total_read if has_sample else None
+    _last_disk_write_bps = total_write if has_sample else None
+    return _last_disk_read_bps, _last_disk_write_bps, _last_disk_speeds, _last_disk_active
 
 
 def _get_gpu_usage() -> float | None:
@@ -265,10 +364,39 @@ def _get_disk_inventory() -> list[dict[str, Any]]:
     return _last_disk_inventory
 
 
-def _get_disk_devices() -> list[dict[str, Any]]:
+def _disk_active_for(row: dict[str, Any], active_times: dict[str, float]) -> float | None:
+    if hardware_info is None:
+        return None
+
+    candidates = []
+    disk_index = hardware_info._to_int(row.get("DiskIndex"))
+    if disk_index is not None:
+        candidates.append(f"physicaldrive{disk_index}")
+    device_id = hardware_info._clean_text(row.get("DiskDeviceId"))
+    if device_id:
+        candidates.append(device_id.replace("\\\\.\\", "").lower())
+    logical = hardware_info._clean_text(row.get("DeviceId"))
+    if logical:
+        candidates.append(logical.lower())
+
+    for candidate in candidates:
+        value = active_times.get(candidate)
+        if value is not None:
+            return value
+    return None
+
+
+def _get_disk_devices(
+    io_speeds: dict[str, tuple[int, int]] | None = None,
+    active_times: dict[str, float] | None = None,
+) -> list[dict[str, Any]]:
+    io_speeds = io_speeds or {}
+    active_times = active_times or {}
     if hardware_info is None:
         try:
             usage = psutil.disk_usage(_get_system_disk_path())
+            read_bps, write_bps = next(iter(io_speeds.values()), (None, None))
+            active_percent = next(iter(active_times.values()), None)
             return [{
                 "mountpoint": _get_system_disk_path(),
                 "partitions": _get_system_disk_path(),
@@ -276,7 +404,11 @@ def _get_disk_devices() -> list[dict[str, Any]]:
                 "totalBytes": usage.total,
                 "usedBytes": usage.used,
                 "freeBytes": usage.free,
-                "usagePercent": round(usage.percent, 1),
+                "usagePercent": active_percent,
+                "activeTimePercent": active_percent,
+                "capacityUsagePercent": round(usage.percent, 1),
+                "readBytesPerSecond": read_bps,
+                "writeBytesPerSecond": write_bps,
             }]
         except Exception:
             return []
@@ -312,6 +444,9 @@ def _get_disk_devices() -> list[dict[str, Any]]:
             hardware_info._clean_text(representative.get("DiskDeviceId"))
             or (f"PhysicalDrive{disk_index}" if disk_index is not None else None)
         )
+        read_bps, write_bps = hardware_info._disk_speed_for(representative, io_speeds)
+        active_percent = _disk_active_for(representative, active_times)
+        capacity_percent = round((used / total) * 100, 1)
         disks.append({
             "mountpoint": ", ".join(hardware_info._unique_text(mountpoints)),
             "partitions": ", ".join(hardware_info._unique_text(mountpoints)),
@@ -319,25 +454,39 @@ def _get_disk_devices() -> list[dict[str, Any]]:
             "totalBytes": total,
             "usedBytes": used,
             "freeBytes": free,
-            "usagePercent": round((used / total) * 100, 1),
+            "usagePercent": active_percent,
+            "activeTimePercent": active_percent,
+            "capacityUsagePercent": capacity_percent,
+            "readBytesPerSecond": read_bps,
+            "writeBytesPerSecond": write_bps,
         })
 
     return disks
 
 
+def _disk_active_percent(disks: list[dict[str, Any]]) -> float | None:
+    values = [
+        _to_float(disk.get("activeTimePercent") if disk.get("activeTimePercent") is not None else disk.get("usagePercent"))
+        for disk in disks
+    ]
+    values = [value for value in values if value is not None]
+    return max(values) if values else None
+
+
+def _sum_disk_speed(disks: list[dict[str, Any]], key: str, fallback: int | None) -> int | None:
+    values = [_to_int(disk.get(key)) for disk in disks]
+    values = [value for value in values if value is not None]
+    return sum(values) if values else fallback
+
+
 def collect_metrics() -> list[dict[str, Any]]:
     """Collect Windows metrics using the same payload shape as Linux."""
-    global _last_net_sent, _last_net_recv, _last_time, _last_disk_io
+    global _last_net_sent, _last_net_recv, _last_time
 
     mem = psutil.virtual_memory()
     swap = psutil.swap_memory()
     cpu_percent = round(psutil.cpu_percent(interval=None), 1)
     mem_percent = round(mem.percent, 1)
-
-    try:
-        disk_percent = round(psutil.disk_usage(_get_system_disk_path()).percent, 1)
-    except Exception:
-        disk_percent = None
 
     current_time = time.time()
     time_diff = max(current_time - _last_time, 1)
@@ -350,13 +499,11 @@ def collect_metrics() -> list[dict[str, Any]]:
     freq = psutil.cpu_freq()
     cpu_freq_mhz = round(freq.current, 1) if freq else None
 
-    cur_disk = psutil.disk_io_counters()
-    if cur_disk and _last_disk_io:
-        disk_read_bps = int(max(0, (cur_disk.read_bytes - _last_disk_io.read_bytes) / time_diff))
-        disk_write_bps = int(max(0, (cur_disk.write_bytes - _last_disk_io.write_bytes) / time_diff))
-    else:
-        disk_read_bps = disk_write_bps = None
-    _last_disk_io = cur_disk
+    disk_read_bps, disk_write_bps, disk_speeds, disk_active = _get_disk_io_speeds(current_time)
+    disk_devices = _get_disk_devices(disk_speeds, disk_active)
+    disk_percent = _disk_active_percent(disk_devices)
+    disk_read_bps = _sum_disk_speed(disk_devices, "readBytesPerSecond", disk_read_bps)
+    disk_write_bps = _sum_disk_speed(disk_devices, "writeBytesPerSecond", disk_write_bps)
 
     memory_perf = _get_memory_perf()
     cached_bytes = memory_perf.get("CacheBytes", getattr(mem, "cached", 0) or 0)
@@ -377,7 +524,7 @@ def collect_metrics() -> list[dict[str, Any]]:
         _metric(12, disk_read_bps),
         _metric(13, disk_write_bps),
         _metric(14, _get_memory_hardware()),
-        _metric(15, _get_disk_devices()),
+        _metric(15, disk_devices),
     ]
 
 
