@@ -78,12 +78,12 @@ _last_disk_inventory_time = 0.0
 _last_cpu_perf: dict[str, float] = {}
 _last_cpu_perf_time = 0.0
 
-CPU_PERF_CACHE_SECONDS = 0.5
+CPU_PERF_CACHE_SECONDS = 1
 GPU_USAGE_CACHE_SECONDS = 1
 POWERSHELL_CACHE_SECONDS = 1
-MEMORY_HARDWARE_CACHE_SECONDS = 60
-DISK_INVENTORY_CACHE_SECONDS = 60
-DISK_IO_CACHE_SECONDS = 0.5
+MEMORY_HARDWARE_CACHE_SECONDS = 60 * 60
+DISK_INVENTORY_CACHE_SECONDS = 60 * 60
+DISK_IO_CACHE_SECONDS = 1
 
 
 def _metric(metric_id: int, value: Any) -> dict[str, Any]:

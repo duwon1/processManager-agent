@@ -116,14 +116,16 @@ _last_disk_io = psutil.disk_io_counters()
 
 # ── 메모리 하드웨어 정보 ────────────────────────────────────────────────────
 
+MEMORY_HARDWARE_CACHE_SECONDS = 60 * 60
 _memory_hardware_cache: dict[str, Any] | None = None
-_memory_hardware_loaded = False
+_memory_hardware_cache_time = 0.0
 
 
 def _get_memory_hardware() -> dict[str, Any] | None:
     """dmidecode 결과를 슬롯 수·총량 bytes·속도 MT/s 같은 표준 숫자 필드로 반환합니다."""
-    global _memory_hardware_cache, _memory_hardware_loaded
-    if _memory_hardware_loaded:
+    global _memory_hardware_cache, _memory_hardware_cache_time
+    now = time.time()
+    if _memory_hardware_cache_time and now - _memory_hardware_cache_time < MEMORY_HARDWARE_CACHE_SECONDS:
         return _memory_hardware_cache
 
     try:
@@ -147,7 +149,7 @@ def _get_memory_hardware() -> dict[str, Any] | None:
         )
         if total_bytes == 0:
             _memory_hardware_cache = None
-            _memory_hardware_loaded = True
+            _memory_hardware_cache_time = now
             return None
 
         slot_count = len(size_lines)
@@ -158,11 +160,11 @@ def _get_memory_hardware() -> dict[str, Any] | None:
             "memoryType": mem_types[0].strip() if mem_types else None,
             "speedMtPerSecond": int(speeds[0]) if speeds else None,
         }
-        _memory_hardware_loaded = True
+        _memory_hardware_cache_time = now
         return _memory_hardware_cache
     except Exception:
         _memory_hardware_cache = None
-        _memory_hardware_loaded = True
+        _memory_hardware_cache_time = now
         return None
 
 

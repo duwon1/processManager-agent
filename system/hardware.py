@@ -3,6 +3,7 @@
 에이전트는 화면용 단위 문자열을 만들지 않고 bytes, seconds, percent 같은 표준 숫자로 반환합니다.
 """
 
+import copy
 import os
 import re
 import shutil
@@ -12,8 +13,21 @@ import time
 
 import psutil
 
+STATIC_CACHE_SECONDS = 60 * 60
+_static_cache = {}
+
 
 # ── 유틸 ─────────────────────────────────────────────────────────────────
+
+def _cached_static(key, loader):
+    now = time.time()
+    cached = _static_cache.get(key)
+    if cached and now - cached[0] < STATIC_CACHE_SECONDS:
+        return copy.deepcopy(cached[1])
+
+    value = loader()
+    _static_cache[key] = (now, copy.deepcopy(value))
+    return value
 
 def _run(cmd, timeout=3) -> str:
     """쉘 명령 실행 후 stdout을 반환합니다. 실패하면 빈 문자열."""
@@ -69,10 +83,17 @@ def _drm_card_device_dirs() -> list[str]:
 
 def _apply_drm_memory_info(entry: dict, device_dir: str) -> None:
     """DRM sysfs가 제공하는 전용/공유 GPU 메모리 정보를 entry에 추가합니다."""
-    vram_total = _read_int_file(os.path.join(device_dir, "mem_info_vram_total"))
+    static_memory = _cached_static(
+        ("drm_memory", device_dir),
+        lambda: {
+            "vramTotal": _read_int_file(os.path.join(device_dir, "mem_info_vram_total")),
+            "gttTotal": _read_int_file(os.path.join(device_dir, "mem_info_gtt_total")),
+        },
+    )
     vram_used = _read_int_file(os.path.join(device_dir, "mem_info_vram_used"))
-    gtt_total = _read_int_file(os.path.join(device_dir, "mem_info_gtt_total"))
     gtt_used = _read_int_file(os.path.join(device_dir, "mem_info_gtt_used"))
+    vram_total = static_memory.get("vramTotal") if isinstance(static_memory, dict) else None
+    gtt_total = static_memory.get("gttTotal") if isinstance(static_memory, dict) else None
 
     if vram_total is not None:
         entry["dedicatedMemoryBytes"] = vram_total
@@ -136,7 +157,7 @@ def _cpu_proc_info():
 
 
 def _collect_cpu() -> dict:
-    model, virt, sockets = _cpu_proc_info()
+    model, virt, sockets = _cached_static("cpu_proc_info", _cpu_proc_info)
     freq = psutil.cpu_freq()
     return {
         "model": model,
@@ -146,9 +167,9 @@ def _collect_cpu() -> dict:
         "cores": psutil.cpu_count(logical=False) or 1,
         "logicalProcessors": psutil.cpu_count(logical=True) or 1,
         "virtualization": virt,
-        "l1CacheBytes": _cache_size_bytes(1),
-        "l2CacheBytes": _cache_size_bytes(2),
-        "l3CacheBytes": _cache_size_bytes(3),
+        "l1CacheBytes": _cached_static("cpu_l1_cache", lambda: _cache_size_bytes(1)),
+        "l2CacheBytes": _cached_static("cpu_l2_cache", lambda: _cache_size_bytes(2)),
+        "l3CacheBytes": _cached_static("cpu_l3_cache", lambda: _cache_size_bytes(3)),
         "uptimeSeconds": int(time.time() - psutil.boot_time()),
     }
 
@@ -203,7 +224,7 @@ def _collect_memory() -> dict:
         "totalBytes": mem.total,
         "usagePercent": mem.percent,
     }
-    info.update(_dmidecode_memory())
+    info.update(_cached_static("memory_dmidecode", _dmidecode_memory))
     return info
 
 
@@ -247,8 +268,14 @@ def _parent_block_device(device: str) -> str:
 
 
 def _disk_type(device: str) -> str:
+    dev = _parent_block_device(device)
+    if not dev:
+        return "N/A"
+    return _cached_static(("disk_type", dev), lambda: _read_disk_type(dev))
+
+
+def _read_disk_type(dev: str) -> str:
     try:
-        dev = _parent_block_device(device)
         path = f"/sys/block/{dev}/queue/rotational"
         if os.path.exists(path):
             with open(path, encoding="utf-8") as f:
@@ -260,8 +287,14 @@ def _disk_type(device: str) -> str:
 
 def _disk_model(device: str) -> str:
     """물리 디스크 제품명을 /sys/block에서 읽습니다."""
+    dev = _parent_block_device(device)
+    if not dev:
+        return ""
+    return _cached_static(("disk_model", dev), lambda: _read_disk_model(dev))
+
+
+def _read_disk_model(dev: str) -> str:
     try:
-        dev = _parent_block_device(device)
         model_path = f"/sys/block/{dev}/device/model"
         if os.path.exists(model_path):
             return open(model_path, encoding="utf-8").read().strip()
@@ -278,7 +311,7 @@ def _collect_disks() -> list:
     groups = {}
 
     io1 = psutil.disk_io_counters(perdisk=True) or {}
-    time.sleep(0.5)
+    time.sleep(1.0)
     io2 = psutil.disk_io_counters(perdisk=True) or {}
 
     for p in psutil.disk_partitions():
@@ -332,8 +365,8 @@ def _collect_disks() -> list:
         d1 = io1.get(dev_name)
         d2 = io2.get(dev_name)
         if d1 and d2:
-            entry["readBytesPerSecond"] = max(0, (d2.read_bytes - d1.read_bytes) * 2)
-            entry["writeBytesPerSecond"] = max(0, (d2.write_bytes - d1.write_bytes) * 2)
+            entry["readBytesPerSecond"] = max(0, d2.read_bytes - d1.read_bytes)
+            entry["writeBytesPerSecond"] = max(0, d2.write_bytes - d1.write_bytes)
 
         results.append(entry)
 
@@ -344,6 +377,10 @@ def _collect_disks() -> list:
 
 def _net_model(iface: str) -> str:
     """네트워크 어댑터 드라이버/제품명을 읽습니다."""
+    return _cached_static(("network_model", iface), lambda: _read_net_model(iface))
+
+
+def _read_net_model(iface: str) -> str:
     try:
         uevent = f"/sys/class/net/{iface}/device/uevent"
         if os.path.exists(uevent):
@@ -399,6 +436,10 @@ def _collect_networks() -> list:
 
 def _lspci_gpus() -> list:
     """lspci에서 GPU 목록을 반환합니다."""
+    return _cached_static("lspci_gpus", _read_lspci_gpus)
+
+
+def _read_lspci_gpus() -> list:
     gpus = []
     out = _run(["lspci"])
     for line in out.splitlines():
@@ -411,33 +452,55 @@ def _lspci_gpus() -> list:
     return gpus
 
 
+def _nvidia_gpu_static() -> list:
+    results = []
+    out = _run([
+        "nvidia-smi",
+        "--query-gpu=name,memory.total,driver_version",
+        "--format=csv,noheader,nounits",
+    ])
+    for line in out.splitlines():
+        parts = [p.strip() for p in line.split(",")]
+        if len(parts) >= 3:
+            total_mib = int(parts[1]) if parts[1].isdigit() else 0
+            results.append({
+                "model": parts[0],
+                "driverVersion": parts[2],
+                "dedicatedMemoryBytes": total_mib * 1024 ** 2 if total_mib else None,
+            })
+    return results
+
+
+def _nvidia_gpu_used_memory() -> list[int | None]:
+    out = _run([
+        "nvidia-smi",
+        "--query-gpu=memory.used",
+        "--format=csv,noheader,nounits",
+    ])
+    values = []
+    for line in out.splitlines():
+        raw = line.strip()
+        values.append(int(raw) * 1024 ** 2 if raw.isdigit() else None)
+    return values
+
+
 def _collect_gpus() -> list:
     """감지된 GPU 전체를 표준 숫자 필드로 수집합니다."""
     results = []
 
-    out = _run([
-        "nvidia-smi",
-        "--query-gpu=name,memory.total,memory.used,driver_version",
-        "--format=csv,noheader,nounits",
-    ])
-    if out:
-        for line in out.splitlines():
-            parts = [p.strip() for p in line.split(",")]
-            if len(parts) >= 4:
-                total_mib = int(parts[1]) if parts[1].isdigit() else 0
-                used_mib = int(parts[2]) if parts[2].isdigit() else 0
-                results.append({
-                    "model": parts[0],
-                    "driverVersion": parts[3],
-                    "dedicatedMemoryBytes": total_mib * 1024 ** 2 if total_mib else None,
-                    "usedMemoryBytes": used_mib * 1024 ** 2 if used_mib else None,
-                })
-        if results:
-            return results
+    static_rows = _cached_static("nvidia_gpu_static", _nvidia_gpu_static)
+    if static_rows:
+        used_memory = _nvidia_gpu_used_memory()
+        for index, row in enumerate(static_rows):
+            entry = dict(row)
+            if index < len(used_memory):
+                entry["usedMemoryBytes"] = used_memory[index]
+            results.append(entry)
+        return results
 
     lspci_models = _lspci_gpus()
     drm_device_dirs = _drm_card_device_dirs()
-    kernel = _run(["uname", "-r"])
+    kernel = _cached_static("kernel_release", lambda: _run(["uname", "-r"]))
 
     for i, model in enumerate(lspci_models):
         entry = {"model": model}

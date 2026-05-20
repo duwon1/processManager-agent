@@ -42,7 +42,7 @@ except Exception:
 SCHEMA_VERSION = 1
 HARDWARE_SAMPLER_INTERVAL_SECONDS = 1.0
 HARDWARE_SNAPSHOT_STALE_SECONDS = 10.0
-STATIC_HARDWARE_CACHE_SECONDS = 600
+STATIC_HARDWARE_CACHE_SECONDS = 60 * 60
 GPU_COUNTER_CACHE_SECONDS = 1
 GPU_TEMPERATURE_CACHE_SECONDS = 1
 MEMORY_PERF_CACHE_SECONDS = 1
@@ -473,7 +473,7 @@ def _physical_disk_key(row: dict[str, Any]) -> str:
     return (logical or "disk").lower()
 
 
-def _sample_disk_io(interval: float = 0.25) -> dict[str, tuple[int, int]]:
+def _sample_disk_io(interval: float = 1.0) -> dict[str, tuple[int, int]]:
     first = psutil.disk_io_counters(perdisk=True) or {}
     time.sleep(interval)
     second = psutil.disk_io_counters(perdisk=True) or {}
