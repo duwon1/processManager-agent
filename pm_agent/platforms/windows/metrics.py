@@ -53,6 +53,7 @@ METRIC_DEFINITIONS = {
     14: ("memory.hardware", "object"),
     15: ("disk.devices", "object"),
     16: ("network.interfaces", "object"),
+    17: ("cpu.logicalProcessors", "object"),
 }
 
 _last_net_sent: int
@@ -591,10 +592,11 @@ def collect_metrics() -> list[dict[str, Any]]:
     mem = psutil.virtual_memory()
     swap = psutil.swap_memory()
     cpu_perf = _get_cpu_perf()
+    cpu_logical = [round(value, 1) for value in psutil.cpu_percent(interval=None, percpu=True)]
     cpu_percent = _first_available(
         cpu_perf.get("utilityPercent"),
         cpu_perf.get("usagePercent"),
-        round(psutil.cpu_percent(interval=None), 1),
+        round(sum(cpu_logical) / len(cpu_logical), 1) if cpu_logical else None,
     )
     mem_percent = round(mem.percent, 1)
 
@@ -643,6 +645,7 @@ def collect_metrics() -> list[dict[str, Any]]:
         _metric(14, _get_memory_hardware()),
         _metric(15, disk_devices),
         _metric(16, network_interfaces),
+        _metric(17, cpu_logical),
     ]
 
 

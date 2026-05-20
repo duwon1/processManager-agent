@@ -32,6 +32,7 @@ METRIC_DEFINITIONS = {
     13: ("disk.writeBytesPerSecond", "bytesPerSecond"),
     14: ("memory.hardware", "object"),
     15: ("disk.devices", "object"),
+    17: ("cpu.logicalProcessors", "object"),
 }
 
 # ── GPU 사용률 ──────────────────────────────────────────────────────────────
@@ -237,7 +238,8 @@ def collect_system_metrics() -> list[dict[str, Any]]:
 
     mem = psutil.virtual_memory()
     swap = psutil.swap_memory()
-    cpu_percent = round(psutil.cpu_percent(interval=None), 1)
+    cpu_logical = [round(value, 1) for value in psutil.cpu_percent(interval=None, percpu=True)]
+    cpu_percent = round(sum(cpu_logical) / len(cpu_logical), 1) if cpu_logical else round(psutil.cpu_percent(interval=None), 1)
     mem_percent = round(mem.percent, 1)
     disk_percent = round(psutil.disk_usage("/").percent, 1)
     gpu_usage = get_gpu_usage()
@@ -276,6 +278,7 @@ def collect_system_metrics() -> list[dict[str, Any]]:
         _metric(13, disk_write_bps),
         _metric(14, _get_memory_hardware()),
         _metric(15, _collect_disk_devices()),
+        _metric(17, cpu_logical),
     ]
 
 
