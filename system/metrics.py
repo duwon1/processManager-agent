@@ -116,6 +116,7 @@ _last_disk_io = psutil.disk_io_counters()
 
 # ── 메모리 하드웨어 정보 ────────────────────────────────────────────────────
 
+# dmidecode는 비싸고 부팅 중 거의 변하지 않으므로 실시간 메트릭과 별도로 1시간 캐시합니다.
 MEMORY_HARDWARE_CACHE_SECONDS = 60 * 60
 _memory_hardware_cache: dict[str, Any] | None = None
 _memory_hardware_cache_time = 0.0

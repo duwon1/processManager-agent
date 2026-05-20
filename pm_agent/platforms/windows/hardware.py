@@ -42,7 +42,9 @@ except Exception:
 SCHEMA_VERSION = 1
 HARDWARE_SAMPLER_INTERVAL_SECONDS = 1.0
 HARDWARE_SNAPSHOT_STALE_SECONDS = 10.0
+# 모델/드라이버/DirectX 같은 인벤토리 값은 부팅 중 거의 변하지 않으므로 1시간 캐시합니다.
 STATIC_HARDWARE_CACHE_SECONDS = 60 * 60
+# 사용률/온도/성능 카운터는 화면에서 1초 단위로 바뀌어야 하므로 짧게 유지합니다.
 GPU_COUNTER_CACHE_SECONDS = 1
 GPU_TEMPERATURE_CACHE_SECONDS = 1
 MEMORY_PERF_CACHE_SECONDS = 1

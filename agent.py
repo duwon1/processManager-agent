@@ -300,7 +300,7 @@ async def run_agent(
                         await asyncio.sleep(0.05)
 
                 async def check_update_loop():
-                    """시작 시 1회, 이후 10분마다 GitHub 최신 커밋을 확인하고 필요하면 업데이트합니다."""
+                    """시작 시 1회, 이후 1분마다 GitHub 최신 커밋을 확인하고 필요하면 업데이트합니다."""
                     await check_and_apply_update("startup")
                     while True:
                         await asyncio.sleep(UPDATE_CHECK_INTERVAL_SECONDS)

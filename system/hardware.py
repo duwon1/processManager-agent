@@ -13,6 +13,7 @@ import time
 
 import psutil
 
+# Linux의 /proc, /sys, dmidecode, lspci 기반 인벤토리 값은 1초 화면 갱신과 분리해 1시간 캐시합니다.
 STATIC_CACHE_SECONDS = 60 * 60
 _static_cache = {}
 
