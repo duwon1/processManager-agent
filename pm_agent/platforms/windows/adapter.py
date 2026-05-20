@@ -4,7 +4,7 @@ from __future__ import annotations
 from typing import Any
 
 from pm_agent.platforms.base import PlatformAdapter
-from pm_agent.platforms.windows import hardware, metrics, processes, uninstaller, updater
+from pm_agent.platforms.windows import hardware, metrics, processes, services, uninstaller, updater
 from pm_agent.platforms.windows.capabilities import WINDOWS_CAPABILITIES
 
 
@@ -27,10 +27,10 @@ class WindowsAdapter(PlatformAdapter):
         return processes.kill_process(pid)
 
     def list_services(self) -> list[dict[str, Any]]:
-        return []
+        return services.list_services()
 
     def control_service(self, name: str, action: str) -> str:
-        raise RuntimeError("Windows 서비스 제어는 아직 지원하지 않습니다.")
+        return services.control_service(name, action)
 
     def collect_hardware(self) -> dict[str, Any]:
         return hardware.collect_hardware()
