@@ -7,8 +7,10 @@ import os
 import platform
 import socket
 import subprocess
+import tempfile
 import threading
 import time
+import xml.etree.ElementTree as ET
 from concurrent.futures import Future, ThreadPoolExecutor
 from typing import Any
 
@@ -42,6 +44,7 @@ HARDWARE_SAMPLER_INTERVAL_SECONDS = 1.0
 HARDWARE_SNAPSHOT_STALE_SECONDS = 10.0
 STATIC_HARDWARE_CACHE_SECONDS = 600
 GPU_COUNTER_CACHE_SECONDS = 30
+GPU_TEMPERATURE_CACHE_SECONDS = 5
 MEMORY_PERF_CACHE_SECONDS = 30
 
 _latest_hardware_snapshot: dict[str, Any] | None = None
@@ -60,6 +63,10 @@ _gpu_counter_cache: dict[str, Any] | None = None
 _gpu_counter_cache_time = 0.0
 _gpu_counter_refreshing = False
 _gpu_counter_lock = threading.Lock()
+_gpu_temperature_cache: list[dict[str, Any]] | None = None
+_gpu_temperature_cache_time = 0.0
+_gpu_temperature_refreshing = False
+_gpu_temperature_lock = threading.Lock()
 
 
 def _item(key: str, value: Any, unit: str = "text") -> dict[str, Any]:
@@ -801,7 +808,7 @@ def _collect_wmi_gpu_inventory() -> list[dict[str, Any]]:
     rows = _as_list(_cached_static(
         "gpu_inventory_wmi",
         lambda: _run_powershell_json(
-            "Get-CimInstance Win32_VideoController | Select-Object Name,DriverVersion,AdapterRAM"
+            "Get-CimInstance Win32_VideoController | Select-Object Name,DriverVersion,DriverDate,AdapterRAM"
         ),
     ))
     return [row for row in rows if isinstance(row, dict)]
@@ -812,6 +819,163 @@ def _collect_dxgi_gpu_inventory() -> list[dict[str, Any]]:
         return []
     rows = _cached_static("gpu_inventory_dxgi", native_gpu_inventory.read_gpu_inventory)
     return [row for row in _as_list(rows) if isinstance(row, dict)]
+
+
+def _parse_mb_text(value: Any) -> int | None:
+    if value is None:
+        return None
+    first = str(value).strip().split(" ", 1)[0].replace(",", "")
+    parsed = _to_int(first)
+    return parsed * 1024 * 1024 if parsed is not None else None
+
+
+def _collect_dxdiag_info() -> dict[str, Any]:
+    creationflags = 0
+    if hasattr(subprocess, "CREATE_NO_WINDOW"):
+        creationflags |= subprocess.CREATE_NO_WINDOW
+
+    path = os.path.join(tempfile.gettempdir(), f"processmanager-dxdiag-{os.getpid()}.xml")
+    try:
+        if os.path.exists(path):
+            os.remove(path)
+        subprocess.run(
+            ["dxdiag", "/whql:off", "/x", path],
+            capture_output=True,
+            timeout=20,
+            creationflags=creationflags,
+        )
+        deadline = time.time() + 5
+        while time.time() < deadline:
+            if os.path.exists(path) and os.path.getsize(path) > 0:
+                break
+            time.sleep(0.2)
+        if not os.path.exists(path) or os.path.getsize(path) <= 0:
+            return {}
+
+        root = ET.parse(path).getroot()
+        system = root.find("SystemInformation")
+        devices = []
+        seen_names: set[str] = set()
+        for device in root.findall(".//DisplayDevice"):
+            name = _clean_text(device.findtext("CardName"))
+            if not name:
+                continue
+            normalized = _normalize_gpu_name(name)
+            if normalized in seen_names:
+                continue
+            seen_names.add(normalized)
+            devices.append({
+                "model": name,
+                "driverVersion": _clean_text(device.findtext("DriverVersion")),
+                "driverDate": _clean_text(device.findtext("DriverDate")),
+                "directXVersion": _clean_text(system.findtext("DirectXVersion")) if system is not None else None,
+                "ddiVersion": _clean_text(device.findtext("DDIVersion")),
+                "featureLevels": _clean_text(device.findtext("FeatureLevels")),
+                "driverModel": _clean_text(device.findtext("DriverModel")),
+                "displayMemoryBytes": _parse_mb_text(device.findtext("DisplayMemory")),
+                "dedicatedMemoryBytes": _parse_mb_text(device.findtext("DedicatedMemory")),
+                "sharedMemoryTotalBytes": _parse_mb_text(device.findtext("SharedMemory")),
+            })
+        return {
+            "directXVersion": _clean_text(system.findtext("DirectXVersion")) if system is not None else None,
+            "displayDevices": devices,
+        }
+    except Exception:
+        return {}
+    finally:
+        try:
+            if os.path.exists(path):
+                os.remove(path)
+        except OSError:
+            pass
+
+
+def _get_dxdiag_info() -> dict[str, Any]:
+    return _cached_static("gpu_dxdiag", _collect_dxdiag_info)
+
+
+def _match_by_model(model: Any, rows: list[dict[str, Any]]) -> dict[str, Any] | None:
+    normalized_model = _normalize_gpu_name(model)
+    for row in rows:
+        row_model = _normalize_gpu_name(row.get("model") or row.get("Name"))
+        if normalized_model and row_model and (
+            normalized_model == row_model or normalized_model in row_model or row_model in normalized_model
+        ):
+            return row
+    return None
+
+
+def _collect_gpu_temperatures() -> list[dict[str, Any]]:
+    creationflags = 0
+    if hasattr(subprocess, "CREATE_NO_WINDOW"):
+        creationflags |= subprocess.CREATE_NO_WINDOW
+    try:
+        result = subprocess.run(
+            [
+                "nvidia-smi",
+                "--query-gpu=name,temperature.gpu",
+                "--format=csv,noheader,nounits",
+            ],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=3,
+            creationflags=creationflags,
+        )
+    except Exception:
+        return []
+
+    if result.returncode != 0:
+        return []
+
+    rows = []
+    for line in result.stdout.splitlines():
+        parts = [part.strip() for part in line.split(",")]
+        if len(parts) < 2:
+            continue
+        rows.append({
+            "model": parts[0],
+            "temperatureCelsius": _to_int(parts[1]),
+        })
+    return rows
+
+
+def _refresh_gpu_temperatures() -> None:
+    global _gpu_temperature_cache, _gpu_temperature_cache_time, _gpu_temperature_refreshing
+
+    try:
+        temperatures = _collect_gpu_temperatures()
+        with _gpu_temperature_lock:
+            _gpu_temperature_cache = temperatures
+            _gpu_temperature_cache_time = time.time()
+    finally:
+        with _gpu_temperature_lock:
+            _gpu_temperature_refreshing = False
+
+
+def _schedule_gpu_temperature_refresh() -> None:
+    global _gpu_temperature_refreshing
+
+    with _gpu_temperature_lock:
+        if _gpu_temperature_refreshing:
+            return
+        _gpu_temperature_refreshing = True
+
+    thread = threading.Thread(target=_refresh_gpu_temperatures, name="pm-gpu-temperature", daemon=True)
+    thread.start()
+
+
+def _get_gpu_temperatures() -> list[dict[str, Any]]:
+    now = time.time()
+    with _gpu_temperature_lock:
+        cached = copy.deepcopy(_gpu_temperature_cache)
+        cache_time = _gpu_temperature_cache_time
+
+    if cached is None or now - cache_time >= GPU_TEMPERATURE_CACHE_SECONDS:
+        _schedule_gpu_temperature_refresh()
+
+    return cached if cached is not None else []
 
 
 def _merge_gpu_inventory(dxgi_rows: list[dict[str, Any]], wmi_rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -835,6 +999,7 @@ def _merge_gpu_inventory(dxgi_rows: list[dict[str, Any]], wmi_rows: list[dict[st
         if match:
             used_wmi_indexes.add(match[0])
             next_row["driverVersion"] = _clean_text(match[1].get("DriverVersion"))
+            next_row["driverDate"] = _clean_text(match[1].get("DriverDate"))
             next_row["wmiAdapterRamBytes"] = _first_number(match[1].get("AdapterRAM"))
         merged.append(next_row)
 
@@ -855,14 +1020,21 @@ def _collect_gpus() -> list[dict[str, Any]]:
     usage_percent = counters["usagePercent"]
     memory_total = psutil.virtual_memory().total
     shared_memory_total = memory_total // 2 if memory_total else None
+    dxdiag_info = _get_dxdiag_info()
+    dxdiag_devices = [row for row in _as_list(dxdiag_info.get("displayDevices")) if isinstance(row, dict)]
+    temperatures = _get_gpu_temperatures()
+    temperature_rows = [row for row in _as_list(temperatures) if isinstance(row, dict)]
 
     for row in rows:
         if not isinstance(row, dict):
             continue
         index = len(gpus)
-        memory = _first_number(row.get("dedicatedMemoryBytes"), row.get("AdapterRAM"))
+        dxdiag = _match_by_model(row.get("model") or row.get("Name"), dxdiag_devices) or {}
+        temperature = _match_by_model(row.get("model") or row.get("Name"), temperature_rows)
+        memory = _first_number(row.get("dedicatedMemoryBytes"), dxdiag.get("dedicatedMemoryBytes"), row.get("AdapterRAM"))
         dedicated_system = _first_number(row.get("dedicatedSystemMemoryBytes"))
-        row_shared_total = _first_number(row.get("sharedMemoryTotalBytes")) or shared_memory_total
+        hardware_reserved = dedicated_system if dedicated_system is not None else None
+        row_shared_total = _first_number(row.get("sharedMemoryTotalBytes"), dxdiag.get("sharedMemoryTotalBytes")) or shared_memory_total
         dedicated_used = dedicated_usage[index] if index < len(dedicated_usage) else None
         shared_used = shared_usage[index] if index < len(shared_usage) else None
         gpu_memory_used_parts = [value for value in (dedicated_used, shared_used) if value is not None]
@@ -871,7 +1043,11 @@ def _collect_gpus() -> list[dict[str, Any]]:
         gpu_memory_total = sum(gpu_memory_total_parts) if gpu_memory_total_parts else None
         gpus.append({
             "model": _clean_text(row.get("model")) or _clean_text(row.get("Name")),
-            "driverVersion": _clean_text(row.get("driverVersion")) or _clean_text(row.get("DriverVersion")),
+            "driverVersion": (
+                _clean_text(row.get("driverVersion"))
+                or _clean_text(row.get("DriverVersion"))
+                or dxdiag.get("driverVersion")
+            ),
             "source": _clean_text(row.get("source")),
             "vendorId": row.get("vendorId"),
             "deviceId": row.get("deviceId"),
@@ -884,8 +1060,16 @@ def _collect_gpus() -> list[dict[str, Any]]:
             "dedicatedMemoryUsedBytes": dedicated_used,
             "dedicatedMemoryTotalBytes": memory,
             "dedicatedSystemMemoryBytes": dedicated_system,
+            "hardwareReservedMemoryBytes": hardware_reserved,
             "sharedMemoryUsedBytes": shared_used,
             "sharedMemoryTotalBytes": row_shared_total,
+            "displayMemoryBytes": dxdiag.get("displayMemoryBytes"),
+            "temperatureCelsius": temperature.get("temperatureCelsius") if temperature else None,
+            "driverDate": dxdiag.get("driverDate") or row.get("driverDate") or row.get("DriverDate"),
+            "directXVersion": dxdiag.get("directXVersion") or dxdiag_info.get("directXVersion"),
+            "ddiVersion": dxdiag.get("ddiVersion"),
+            "featureLevels": dxdiag.get("featureLevels"),
+            "driverModel": dxdiag.get("driverModel"),
             "usagePercent": usage_percent,
         })
     return gpus
@@ -959,8 +1143,17 @@ def _gpu_groups(gpus: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 _item("gpuMemoryTotalBytes", gpu.get("gpuMemoryTotalBytes"), "bytes"),
                 _item("dedicatedMemoryUsedBytes", gpu.get("dedicatedMemoryUsedBytes"), "bytes"),
                 _item("dedicatedMemoryTotalBytes", gpu.get("dedicatedMemoryTotalBytes"), "bytes"),
+                _item("dedicatedSystemMemoryBytes", gpu.get("dedicatedSystemMemoryBytes"), "bytes"),
+                _item("hardwareReservedMemoryBytes", gpu.get("hardwareReservedMemoryBytes"), "bytes"),
                 _item("sharedMemoryUsedBytes", gpu.get("sharedMemoryUsedBytes"), "bytes"),
                 _item("sharedMemoryTotalBytes", gpu.get("sharedMemoryTotalBytes"), "bytes"),
+                _item("displayMemoryBytes", gpu.get("displayMemoryBytes"), "bytes"),
+                _item("temperatureCelsius", gpu.get("temperatureCelsius"), "celsius"),
+                _item("driverDate", gpu.get("driverDate")),
+                _item("directXVersion", gpu.get("directXVersion")),
+                _item("ddiVersion", gpu.get("ddiVersion")),
+                _item("featureLevels", gpu.get("featureLevels")),
+                _item("driverModel", gpu.get("driverModel")),
                 _item("usagePercent", gpu.get("usagePercent"), "percent"),
             ],
         })
@@ -1097,8 +1290,17 @@ def _build_hardware_payload(
                     "gpuMemoryTotalBytes": gpu.get("gpuMemoryTotalBytes"),
                     "dedicatedMemoryUsedBytes": gpu.get("dedicatedMemoryUsedBytes"),
                     "dedicatedMemoryTotalBytes": gpu.get("dedicatedMemoryTotalBytes"),
+                    "dedicatedSystemMemoryBytes": gpu.get("dedicatedSystemMemoryBytes"),
+                    "hardwareReservedMemoryBytes": gpu.get("hardwareReservedMemoryBytes"),
                     "sharedMemoryUsedBytes": gpu.get("sharedMemoryUsedBytes"),
                     "sharedMemoryTotalBytes": gpu.get("sharedMemoryTotalBytes"),
+                    "displayMemoryBytes": gpu.get("displayMemoryBytes"),
+                    "temperatureCelsius": gpu.get("temperatureCelsius"),
+                    "driverDate": gpu.get("driverDate"),
+                    "directXVersion": gpu.get("directXVersion"),
+                    "ddiVersion": gpu.get("ddiVersion"),
+                    "featureLevels": gpu.get("featureLevels"),
+                    "driverModel": gpu.get("driverModel"),
                     "usagePercent": gpu.get("usagePercent"),
                 }
                 for gpu in gpus
@@ -1251,18 +1453,28 @@ def _collect_gpus_quick() -> list[dict[str, Any]]:
     gpus = []
     memory_total = psutil.virtual_memory().total
     shared_memory_total = memory_total // 2 if memory_total else None
+    dxdiag_info = _get_cached_static("gpu_dxdiag") or {}
+    dxdiag_devices = [row for row in _as_list(dxdiag_info.get("displayDevices")) if isinstance(row, dict)]
+    temperature_rows = [row for row in _as_list(_get_gpu_temperatures()) if isinstance(row, dict)]
     for row in rows:
         if not isinstance(row, dict):
             continue
-        dedicated_total = _first_number(row.get("dedicatedMemoryBytes"), row.get("AdapterRAM"))
+        dxdiag = _match_by_model(row.get("model") or row.get("Name"), dxdiag_devices) or {}
+        temperature = _match_by_model(row.get("model") or row.get("Name"), temperature_rows)
+        dedicated_total = _first_number(row.get("dedicatedMemoryBytes"), dxdiag.get("dedicatedMemoryBytes"), row.get("AdapterRAM"))
         dedicated_system = _first_number(row.get("dedicatedSystemMemoryBytes"))
-        row_shared_total = _first_number(row.get("sharedMemoryTotalBytes")) or shared_memory_total
+        hardware_reserved = dedicated_system if dedicated_system is not None else None
+        row_shared_total = _first_number(row.get("sharedMemoryTotalBytes"), dxdiag.get("sharedMemoryTotalBytes")) or shared_memory_total
         gpu_memory_total_parts = [
             value for value in (dedicated_total, dedicated_system, row_shared_total) if value is not None
         ]
         gpus.append({
             "model": _clean_text(row.get("model")) or _clean_text(row.get("Name")),
-            "driverVersion": _clean_text(row.get("driverVersion")) or _clean_text(row.get("DriverVersion")),
+            "driverVersion": (
+                _clean_text(row.get("driverVersion"))
+                or _clean_text(row.get("DriverVersion"))
+                or dxdiag.get("driverVersion")
+            ),
             "source": _clean_text(row.get("source")),
             "vendorId": row.get("vendorId"),
             "deviceId": row.get("deviceId"),
@@ -1275,8 +1487,16 @@ def _collect_gpus_quick() -> list[dict[str, Any]]:
             "dedicatedMemoryUsedBytes": None,
             "dedicatedMemoryTotalBytes": dedicated_total,
             "dedicatedSystemMemoryBytes": dedicated_system,
+            "hardwareReservedMemoryBytes": hardware_reserved,
             "sharedMemoryUsedBytes": None,
             "sharedMemoryTotalBytes": row_shared_total,
+            "displayMemoryBytes": dxdiag.get("displayMemoryBytes"),
+            "temperatureCelsius": temperature.get("temperatureCelsius") if temperature else None,
+            "driverDate": dxdiag.get("driverDate") or row.get("driverDate") or row.get("DriverDate"),
+            "directXVersion": dxdiag.get("directXVersion") or dxdiag_info.get("directXVersion"),
+            "ddiVersion": dxdiag.get("ddiVersion"),
+            "featureLevels": dxdiag.get("featureLevels"),
+            "driverModel": dxdiag.get("driverModel"),
             "usagePercent": None,
         })
     return gpus
