@@ -681,7 +681,7 @@ def _read_gpu_counters() -> dict[str, Any]:
         "$dedicated = @(Get-Counter '\\GPU Adapter Memory(*)\\Dedicated Usage' -ErrorAction SilentlyContinue).CounterSamples | Select-Object Path,CookedValue; "
         "$shared = @(Get-Counter '\\GPU Adapter Memory(*)\\Shared Usage' -ErrorAction SilentlyContinue).CounterSamples | Select-Object Path,CookedValue; "
         "$samples = (Get-Counter '\\GPU Engine(*)\\Utilization Percentage' -ErrorAction SilentlyContinue).CounterSamples; "
-        "$value = ($samples | Measure-Object -Property CookedValue -Sum).Sum; "
+        "$value = ($samples | Measure-Object -Property CookedValue -Maximum).Maximum; "
         "if ($null -eq $value) { $value = 0 }; "
         "[pscustomobject]@{Dedicated=$dedicated; Shared=$shared; Usage=[Math]::Round([Math]::Min([double]$value, 100), 1)}",
         timeout=8,

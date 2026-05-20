@@ -159,17 +159,17 @@ class PdhGpuUsageSampler:
 
         items_type = PDH_FMT_COUNTERVALUE_ITEM_W * item_count.value
         items = ctypes.cast(buffer, ctypes.POINTER(items_type)).contents
-        total = 0.0
+        peak = 0.0
         found = False
         for item in items:
             if item.FmtValue.CStatus not in (ERROR_SUCCESS, 1):
                 continue
-            total += max(0.0, float(item.FmtValue.doubleValue))
+            peak = max(peak, max(0.0, float(item.FmtValue.doubleValue)))
             found = True
 
         if not found:
             return None
-        return round(min(total, 100.0), 1)
+        return round(min(peak, 100.0), 1)
 
 
 class PdhGpuMemorySampler:
