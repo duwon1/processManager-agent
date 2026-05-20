@@ -26,6 +26,8 @@ PDH_DISK_COUNTERS = {
     "idlePercent": r"\PhysicalDisk(*)\% Idle Time",
     "readBytesPerSecond": r"\PhysicalDisk(*)\Disk Read Bytes/sec",
     "writeBytesPerSecond": r"\PhysicalDisk(*)\Disk Write Bytes/sec",
+    "averageResponseSeconds": r"\PhysicalDisk(*)\Avg. Disk sec/Transfer",
+    "queueLength": r"\PhysicalDisk(*)\Current Disk Queue Length",
 }
 
 
@@ -88,10 +90,14 @@ class PdhDiskSampler:
             idle = samples.get("idlePercent", {}).get(key)
             read_bps = samples.get("readBytesPerSecond", {}).get(key)
             write_bps = samples.get("writeBytesPerSecond", {}).get(key)
+            response_seconds = samples.get("averageResponseSeconds", {}).get(key)
+            queue_length = samples.get("queueLength", {}).get(key)
             result[key] = {
                 "activeTimePercent": round(max(0.0, min(100.0, 100.0 - idle)), 1) if idle is not None else None,
                 "readBytesPerSecond": max(0.0, read_bps or 0.0),
                 "writeBytesPerSecond": max(0.0, write_bps or 0.0),
+                "averageResponseTimeMs": round(max(0.0, response_seconds or 0.0) * 1000, 1) if response_seconds is not None else None,
+                "queueLength": round(max(0.0, queue_length or 0.0), 2) if queue_length is not None else None,
             }
         return result
 

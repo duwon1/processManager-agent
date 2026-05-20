@@ -12,6 +12,11 @@ from typing import Any
 import psutil
 
 try:
+    from pm_agent.platforms.windows import native_cpu_perf
+except Exception:
+    native_cpu_perf = None
+
+try:
     from pm_agent.platforms.windows import native_gpu_usage
 except Exception:
     native_gpu_usage = None
@@ -47,10 +52,12 @@ METRIC_DEFINITIONS = {
     13: ("disk.writeBytesPerSecond", "bytesPerSecond"),
     14: ("memory.hardware", "object"),
     15: ("disk.devices", "object"),
+    16: ("network.interfaces", "object"),
 }
 
 _last_net_sent: int
 _last_net_recv: int
+_last_net_interfaces: dict[str, Any]
 _last_time: float
 _last_disk_io = psutil.disk_io_counters(perdisk=True) or {}
 _last_disk_io_time = time.time()
@@ -59,6 +66,7 @@ _last_disk_read_bps: int | None = None
 _last_disk_write_bps: int | None = None
 _last_disk_speeds: dict[str, tuple[int, int]] = {}
 _last_disk_active: dict[str, float] = {}
+_last_disk_details: dict[str, dict[str, Any]] = {}
 _last_gpu_usage_value: float | None = None
 _last_gpu_usage_time = 0.0
 _last_memory_perf: dict[str, int] = {}
@@ -67,7 +75,10 @@ _last_memory_hardware: dict[str, Any] | None = None
 _last_memory_hardware_time = 0.0
 _last_disk_inventory: list[dict[str, Any]] = []
 _last_disk_inventory_time = 0.0
+_last_cpu_perf: dict[str, float] = {}
+_last_cpu_perf_time = 0.0
 
+CPU_PERF_CACHE_SECONDS = 0.5
 GPU_USAGE_CACHE_SECONDS = 1
 POWERSHELL_CACHE_SECONDS = 10
 MEMORY_HARDWARE_CACHE_SECONDS = 60
@@ -107,6 +118,57 @@ def _get_net_io() -> tuple[int, int]:
         sent += counter.bytes_sent
         recv += counter.bytes_recv
     return sent, recv
+
+
+def _get_net_io_per_interface() -> dict[str, Any]:
+    return {
+        nic: counter
+        for nic, counter in psutil.net_io_counters(pernic=True).items()
+        if not _is_loopback_interface(nic)
+    }
+
+
+def _network_interface_speeds(
+    current: dict[str, Any],
+    previous: dict[str, Any],
+    elapsed: float,
+) -> list[dict[str, Any]]:
+    networks: list[dict[str, Any]] = []
+    for name, counter in current.items():
+        before = previous.get(name)
+        if before is None:
+            sent_bps = None
+            recv_bps = None
+        else:
+            sent_bps = int(max(0, (counter.bytes_sent - before.bytes_sent) / elapsed))
+            recv_bps = int(max(0, (counter.bytes_recv - before.bytes_recv) / elapsed))
+
+        networks.append({
+            "adapterName": name,
+            "sentBytesPerSecond": sent_bps,
+            "receivedBytesPerSecond": recv_bps,
+        })
+    return networks
+
+
+def _get_cpu_perf(now: float | None = None) -> dict[str, float]:
+    global _last_cpu_perf, _last_cpu_perf_time
+
+    current_time = now or time.time()
+    if current_time - _last_cpu_perf_time < CPU_PERF_CACHE_SECONDS:
+        return _last_cpu_perf
+
+    values = native_cpu_perf.read_cpu_perf() if native_cpu_perf is not None else {}
+    _last_cpu_perf = values
+    _last_cpu_perf_time = current_time
+    return _last_cpu_perf
+
+
+def _first_available(*values: Any) -> Any:
+    for value in values:
+        if value is not None:
+            return value
+    return None
 
 
 def _get_system_disk_path() -> str:
@@ -181,7 +243,7 @@ def _disk_io_key(name: Any) -> str:
     return str(name or "").replace("\\\\.\\", "").lower()
 
 
-def _get_native_disk_io() -> tuple[int | None, int | None, dict[str, tuple[int, int]], dict[str, float]] | None:
+def _get_native_disk_io() -> tuple[int | None, int | None, dict[str, tuple[int, int]], dict[str, float], dict[str, dict[str, Any]]] | None:
     if native_disk_usage is None:
         return None
 
@@ -191,6 +253,7 @@ def _get_native_disk_io() -> tuple[int | None, int | None, dict[str, tuple[int, 
 
     speeds: dict[str, tuple[int, int]] = {}
     active: dict[str, float] = {}
+    details: dict[str, dict[str, Any]] = {}
     total_read = 0
     total_write = 0
     for key, values in rows.items():
@@ -200,23 +263,28 @@ def _get_native_disk_io() -> tuple[int | None, int | None, dict[str, tuple[int, 
         speeds[key] = (read_bps, write_bps)
         if active_percent is not None:
             active[key] = max(0.0, min(float(active_percent), 100.0))
+        details[key] = {
+            "activeTimePercent": active.get(key),
+            "averageResponseTimeMs": values.get("averageResponseTimeMs"),
+            "queueLength": values.get("queueLength"),
+        }
         total_read += read_bps
         total_write += write_bps
 
-    return total_read, total_write, speeds, active
+    return total_read, total_write, speeds, active, details
 
 
-def _get_disk_io_speeds(now: float | None = None) -> tuple[int | None, int | None, dict[str, tuple[int, int]], dict[str, float]]:
+def _get_disk_io_speeds(now: float | None = None) -> tuple[int | None, int | None, dict[str, tuple[int, int]], dict[str, float], dict[str, dict[str, Any]]]:
     global _last_disk_io, _last_disk_io_time, _last_disk_speed_time
-    global _last_disk_read_bps, _last_disk_write_bps, _last_disk_speeds, _last_disk_active
+    global _last_disk_read_bps, _last_disk_write_bps, _last_disk_speeds, _last_disk_active, _last_disk_details
 
     current_time = now or time.time()
     if current_time - _last_disk_speed_time < DISK_IO_CACHE_SECONDS:
-        return _last_disk_read_bps, _last_disk_write_bps, _last_disk_speeds, _last_disk_active
+        return _last_disk_read_bps, _last_disk_write_bps, _last_disk_speeds, _last_disk_active, _last_disk_details
 
     native_sample = _get_native_disk_io()
     if native_sample is not None:
-        _last_disk_read_bps, _last_disk_write_bps, _last_disk_speeds, _last_disk_active = native_sample
+        _last_disk_read_bps, _last_disk_write_bps, _last_disk_speeds, _last_disk_active, _last_disk_details = native_sample
         _last_disk_speed_time = current_time
         _last_disk_io_time = current_time
         return native_sample
@@ -226,6 +294,7 @@ def _get_disk_io_speeds(now: float | None = None) -> tuple[int | None, int | Non
     elapsed_ms = elapsed * 1000
     speeds: dict[str, tuple[int, int]] = {}
     active: dict[str, float] = {}
+    details: dict[str, dict[str, Any]] = {}
     total_read = 0
     total_write = 0
     has_sample = False
@@ -241,6 +310,11 @@ def _get_disk_io_speeds(now: float | None = None) -> tuple[int | None, int | Non
         write_ms = max(0, getattr(after, "write_time", 0) - getattr(before, "write_time", 0))
         speeds[key] = (read_bps, write_bps)
         active[key] = round(min(((read_ms + write_ms) / elapsed_ms) * 100, 100.0), 1)
+        details[key] = {
+            "activeTimePercent": active[key],
+            "averageResponseTimeMs": None,
+            "queueLength": None,
+        }
         total_read += read_bps
         total_write += write_bps
         has_sample = True
@@ -250,9 +324,10 @@ def _get_disk_io_speeds(now: float | None = None) -> tuple[int | None, int | Non
     _last_disk_speed_time = current_time
     _last_disk_speeds = speeds
     _last_disk_active = active
+    _last_disk_details = details
     _last_disk_read_bps = total_read if has_sample else None
     _last_disk_write_bps = total_write if has_sample else None
-    return _last_disk_read_bps, _last_disk_write_bps, _last_disk_speeds, _last_disk_active
+    return _last_disk_read_bps, _last_disk_write_bps, _last_disk_speeds, _last_disk_active, _last_disk_details
 
 
 def _get_gpu_usage() -> float | None:
@@ -386,12 +461,36 @@ def _disk_active_for(row: dict[str, Any], active_times: dict[str, float]) -> flo
     return None
 
 
+def _disk_details_for(row: dict[str, Any], disk_details: dict[str, dict[str, Any]]) -> dict[str, Any]:
+    if hardware_info is None:
+        return {}
+
+    candidates = []
+    disk_index = hardware_info._to_int(row.get("DiskIndex"))
+    if disk_index is not None:
+        candidates.append(f"physicaldrive{disk_index}")
+    device_id = hardware_info._clean_text(row.get("DiskDeviceId"))
+    if device_id:
+        candidates.append(device_id.replace("\\\\.\\", "").lower())
+    logical = hardware_info._clean_text(row.get("DeviceId"))
+    if logical:
+        candidates.append(logical.lower())
+
+    for candidate in candidates:
+        value = disk_details.get(candidate)
+        if value:
+            return value
+    return {}
+
+
 def _get_disk_devices(
     io_speeds: dict[str, tuple[int, int]] | None = None,
     active_times: dict[str, float] | None = None,
+    disk_details: dict[str, dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
     io_speeds = io_speeds or {}
     active_times = active_times or {}
+    disk_details = disk_details or {}
     if hardware_info is None:
         try:
             usage = psutil.disk_usage(_get_system_disk_path())
@@ -409,6 +508,8 @@ def _get_disk_devices(
                 "capacityUsagePercent": round(usage.percent, 1),
                 "readBytesPerSecond": read_bps,
                 "writeBytesPerSecond": write_bps,
+                "averageResponseTimeMs": next((details.get("averageResponseTimeMs") for details in disk_details.values() if details), None),
+                "queueLength": next((details.get("queueLength") for details in disk_details.values() if details), None),
             }]
         except Exception:
             return []
@@ -446,6 +547,7 @@ def _get_disk_devices(
         )
         read_bps, write_bps = hardware_info._disk_speed_for(representative, io_speeds)
         active_percent = _disk_active_for(representative, active_times)
+        detail = _disk_details_for(representative, disk_details)
         capacity_percent = round((used / total) * 100, 1)
         disks.append({
             "mountpoint": ", ".join(hardware_info._unique_text(mountpoints)),
@@ -459,6 +561,8 @@ def _get_disk_devices(
             "capacityUsagePercent": capacity_percent,
             "readBytesPerSecond": read_bps,
             "writeBytesPerSecond": write_bps,
+            "averageResponseTimeMs": detail.get("averageResponseTimeMs"),
+            "queueLength": detail.get("queueLength"),
         })
 
     return disks
@@ -481,26 +585,38 @@ def _sum_disk_speed(disks: list[dict[str, Any]], key: str, fallback: int | None)
 
 def collect_metrics() -> list[dict[str, Any]]:
     """Collect Windows metrics using the same payload shape as Linux."""
-    global _last_net_sent, _last_net_recv, _last_time
+    global _last_net_sent, _last_net_recv, _last_net_interfaces, _last_time
 
     mem = psutil.virtual_memory()
     swap = psutil.swap_memory()
-    cpu_percent = round(psutil.cpu_percent(interval=None), 1)
+    cpu_perf = _get_cpu_perf()
+    cpu_percent = _first_available(
+        cpu_perf.get("utilityPercent"),
+        cpu_perf.get("usagePercent"),
+        round(psutil.cpu_percent(interval=None), 1),
+    )
     mem_percent = round(mem.percent, 1)
 
     current_time = time.time()
     time_diff = max(current_time - _last_time, 1)
 
     cur_sent, cur_recv = _get_net_io()
+    cur_net_interfaces = _get_net_io_per_interface()
     sent_bps = int(max(0, (cur_sent - _last_net_sent) / time_diff))
     recv_bps = int(max(0, (cur_recv - _last_net_recv) / time_diff))
-    _last_net_sent, _last_net_recv, _last_time = cur_sent, cur_recv, current_time
+    network_interfaces = _network_interface_speeds(cur_net_interfaces, _last_net_interfaces, time_diff)
+    _last_net_sent, _last_net_recv = cur_sent, cur_recv
+    _last_net_interfaces = cur_net_interfaces
+    _last_time = current_time
 
     freq = psutil.cpu_freq()
-    cpu_freq_mhz = round(freq.current, 1) if freq else None
+    cpu_freq_mhz = _first_available(
+        cpu_perf.get("currentSpeedMhz"),
+        round(freq.current, 1) if freq else None,
+    )
 
-    disk_read_bps, disk_write_bps, disk_speeds, disk_active = _get_disk_io_speeds(current_time)
-    disk_devices = _get_disk_devices(disk_speeds, disk_active)
+    disk_read_bps, disk_write_bps, disk_speeds, disk_active, disk_details = _get_disk_io_speeds(current_time)
+    disk_devices = _get_disk_devices(disk_speeds, disk_active, disk_details)
     disk_percent = _disk_active_percent(disk_devices)
     disk_read_bps = _sum_disk_speed(disk_devices, "readBytesPerSecond", disk_read_bps)
     disk_write_bps = _sum_disk_speed(disk_devices, "writeBytesPerSecond", disk_write_bps)
@@ -525,6 +641,7 @@ def collect_metrics() -> list[dict[str, Any]]:
         _metric(13, disk_write_bps),
         _metric(14, _get_memory_hardware()),
         _metric(15, disk_devices),
+        _metric(16, network_interfaces),
     ]
 
 
@@ -538,4 +655,5 @@ def get_self_ip() -> str:
 
 
 _last_net_sent, _last_net_recv = _get_net_io()
+_last_net_interfaces = _get_net_io_per_interface()
 _last_time = time.time()

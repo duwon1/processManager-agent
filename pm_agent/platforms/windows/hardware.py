@@ -17,9 +17,19 @@ import psutil
 from pm_agent.platforms.windows.capabilities import WINDOWS_CAPABILITIES
 
 try:
+    from pm_agent.platforms.windows import native_cpu_perf
+except Exception:
+    native_cpu_perf = None
+
+try:
     from pm_agent.platforms.windows import native_gpu_usage
 except Exception:
     native_gpu_usage = None
+
+try:
+    from pm_agent.platforms.windows import native_gpu_inventory
+except Exception:
+    native_gpu_inventory = None
 
 try:
     from pm_agent.platforms.windows import native_memory_perf
@@ -154,6 +164,13 @@ def _to_int(value: Any) -> int | None:
         return None
 
 
+def _first_available(*values: Any) -> Any:
+    for value in values:
+        if value is not None:
+            return value
+    return None
+
+
 def _kb_to_bytes(value: Any) -> int | None:
     parsed = _to_int(value)
     return parsed * 1024 if parsed is not None else None
@@ -206,15 +223,36 @@ def _collect_physical_memory() -> dict[str, Any]:
     ]
     form_factors = [form_factor for form_factor in form_factors if form_factor]
 
+    array_rows = _as_list(_cached_static(
+        "physical_memory_array",
+        lambda: _run_powershell_json(
+            "Get-CimInstance Win32_PhysicalMemoryArray | Select-Object MemoryDevices"
+        ),
+    ))
+    slots_total = None
+    if array_rows:
+        slots_total = sum(
+            value for value in (_to_int(row.get("MemoryDevices")) for row in array_rows if isinstance(row, dict))
+            if value is not None
+        ) or None
+
+    total_installed = sum(
+        value for value in (_to_int(row.get("Capacity")) for row in rows if isinstance(row, dict))
+        if value is not None
+    ) or None
+
     return {
         "speedMtPerSecond": speeds[0] if speeds else None,
         "slotsUsed": len(rows),
+        "slotsTotal": slots_total,
         "formFactor": form_factors[0] if form_factors else None,
+        "installedBytes": total_installed,
     }
 
 
 def _collect_cpu() -> dict[str, Any]:
     freq = psutil.cpu_freq()
+    perf = native_cpu_perf.read_cpu_perf() if native_cpu_perf is not None else {}
     rows = _as_list(_cached_static(
         "cpu_inventory",
         lambda: _run_powershell_json(
@@ -245,7 +283,11 @@ def _collect_cpu() -> dict[str, Any]:
         "cores": _to_int(first.get("NumberOfCores")) or psutil.cpu_count(logical=False) or 1,
         "logicalProcessors": _to_int(first.get("NumberOfLogicalProcessors")) or psutil.cpu_count(logical=True) or 1,
         "baseSpeedMhz": _to_int(first.get("MaxClockSpeed")) or (round(freq.max, 1) if freq and freq.max else None),
-        "currentSpeedMhz": _to_int(first.get("CurrentClockSpeed")) or (round(freq.current, 1) if freq else None),
+        "currentSpeedMhz": _first_available(
+            perf.get("currentSpeedMhz"),
+            _to_int(first.get("CurrentClockSpeed")),
+            round(freq.current, 1) if freq else None,
+        ),
         "virtualization": _available_flag(first.get("VirtualizationFirmwareEnabled")),
         "l2CacheBytes": _kb_to_bytes(first.get("L2CacheSize")),
         "l3CacheBytes": _kb_to_bytes(first.get("L3CacheSize")),
@@ -261,14 +303,14 @@ def _read_memory_perf() -> dict[str, int]:
 
     data = _run_powershell_json(
         "Get-CimInstance Win32_PerfRawData_PerfOS_Memory | "
-        "Select-Object CacheBytes,CommittedBytes,CommitLimit",
+        "Select-Object CacheBytes,CommittedBytes,CommitLimit,PoolPagedBytes,PoolNonpagedBytes",
         timeout=5,
     )
     if not isinstance(data, dict):
         return {}
 
     result: dict[str, int] = {}
-    for key in ("CacheBytes", "CommittedBytes", "CommitLimit"):
+    for key in ("CacheBytes", "CommittedBytes", "CommitLimit", "PoolPagedBytes", "PoolNonpagedBytes"):
         value = _to_int(data.get(key))
         if value is not None:
             result[key] = value
@@ -316,6 +358,9 @@ def _collect_memory() -> dict[str, Any]:
     mem = psutil.virtual_memory()
     swap = psutil.swap_memory()
     perf = _collect_memory_perf()
+    physical = _collect_physical_memory()
+    installed_bytes = physical.get("installedBytes")
+    hardware_reserved = max(0, installed_bytes - mem.total) if installed_bytes and installed_bytes > mem.total else None
     return {
         "totalBytes": mem.total,
         "usedBytes": mem.used,
@@ -324,7 +369,10 @@ def _collect_memory() -> dict[str, Any]:
         "cachedBytes": perf.get("CacheBytes", getattr(mem, "cached", 0) or 0),
         "committedBytes": perf.get("CommittedBytes", mem.used + getattr(swap, "used", 0)),
         "commitLimitBytes": perf.get("CommitLimit", mem.total + getattr(swap, "total", 0)),
-        **_collect_physical_memory(),
+        "pagedPoolBytes": perf.get("PoolPagedBytes"),
+        "nonPagedPoolBytes": perf.get("PoolNonpagedBytes"),
+        "hardwareReservedBytes": hardware_reserved,
+        **physical,
     }
 
 
@@ -495,6 +543,7 @@ def _collect_disks() -> list[dict[str, Any]]:
                 "usedBytes": used,
                 "freeBytes": free if total else None,
                 "usagePercent": percent,
+                "capacityUsagePercent": percent,
                 "readBytesPerSecond": read_bps,
                 "writeBytesPerSecond": write_bps,
                 "type": _normalize_disk_type(representative.get("PhysicalMediaType"), representative.get("BusType")),
@@ -518,6 +567,7 @@ def _collect_disks() -> list[dict[str, Any]]:
             "usedBytes": usage.used,
             "freeBytes": usage.free,
             "usagePercent": round(usage.percent, 1),
+            "capacityUsagePercent": round(usage.percent, 1),
             "readBytesPerSecond": read_bps,
             "writeBytesPerSecond": write_bps,
             "type": None,
@@ -743,30 +793,99 @@ def _collect_gpu_counters() -> dict[str, Any]:
     return cached if cached is not None else _empty_gpu_counters()
 
 
-def _collect_gpus() -> list[dict[str, Any]]:
+def _normalize_gpu_name(value: Any) -> str:
+    return "".join(ch for ch in str(value or "").lower() if ch.isalnum())
+
+
+def _collect_wmi_gpu_inventory() -> list[dict[str, Any]]:
     rows = _as_list(_cached_static(
-        "gpu_inventory",
+        "gpu_inventory_wmi",
         lambda: _run_powershell_json(
             "Get-CimInstance Win32_VideoController | Select-Object Name,DriverVersion,AdapterRAM"
         ),
     ))
+    return [row for row in rows if isinstance(row, dict)]
+
+
+def _collect_dxgi_gpu_inventory() -> list[dict[str, Any]]:
+    if native_gpu_inventory is None:
+        return []
+    rows = _cached_static("gpu_inventory_dxgi", native_gpu_inventory.read_gpu_inventory)
+    return [row for row in _as_list(rows) if isinstance(row, dict)]
+
+
+def _merge_gpu_inventory(dxgi_rows: list[dict[str, Any]], wmi_rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    if not dxgi_rows:
+        return [{**row, "source": "wmi"} for row in wmi_rows]
+
+    used_wmi_indexes: set[int] = set()
+    merged: list[dict[str, Any]] = []
+    for dxgi_row in dxgi_rows:
+        dxgi_name = _normalize_gpu_name(dxgi_row.get("model"))
+        match = None
+        for index, wmi_row in enumerate(wmi_rows):
+            if index in used_wmi_indexes:
+                continue
+            wmi_name = _normalize_gpu_name(wmi_row.get("Name"))
+            if dxgi_name and wmi_name and (dxgi_name == wmi_name or dxgi_name in wmi_name or wmi_name in dxgi_name):
+                match = (index, wmi_row)
+                break
+
+        next_row = dict(dxgi_row)
+        if match:
+            used_wmi_indexes.add(match[0])
+            next_row["driverVersion"] = _clean_text(match[1].get("DriverVersion"))
+            next_row["wmiAdapterRamBytes"] = _first_number(match[1].get("AdapterRAM"))
+        merged.append(next_row)
+
+    return merged
+
+
+def _collect_gpu_inventory() -> list[dict[str, Any]]:
+    wmi_rows = _collect_wmi_gpu_inventory()
+    return _merge_gpu_inventory(_collect_dxgi_gpu_inventory(), wmi_rows)
+
+
+def _collect_gpus() -> list[dict[str, Any]]:
+    rows = _collect_gpu_inventory()
     gpus: list[dict[str, Any]] = []
     counters = _collect_gpu_counters()
     dedicated_usage = counters["dedicated"]
     shared_usage = counters["shared"]
     usage_percent = counters["usagePercent"]
+    memory_total = psutil.virtual_memory().total
+    shared_memory_total = memory_total // 2 if memory_total else None
 
     for row in rows:
         if not isinstance(row, dict):
             continue
         index = len(gpus)
-        memory = _first_number(row.get("AdapterRAM"))
+        memory = _first_number(row.get("dedicatedMemoryBytes"), row.get("AdapterRAM"))
+        dedicated_system = _first_number(row.get("dedicatedSystemMemoryBytes"))
+        row_shared_total = _first_number(row.get("sharedMemoryTotalBytes")) or shared_memory_total
+        dedicated_used = dedicated_usage[index] if index < len(dedicated_usage) else None
+        shared_used = shared_usage[index] if index < len(shared_usage) else None
+        gpu_memory_used_parts = [value for value in (dedicated_used, shared_used) if value is not None]
+        gpu_memory_total_parts = [value for value in (memory, dedicated_system, row_shared_total) if value is not None]
+        gpu_memory_used = sum(gpu_memory_used_parts) if gpu_memory_used_parts else None
+        gpu_memory_total = sum(gpu_memory_total_parts) if gpu_memory_total_parts else None
         gpus.append({
-            "model": _clean_text(row.get("Name")),
-            "driverVersion": _clean_text(row.get("DriverVersion")),
+            "model": _clean_text(row.get("model")) or _clean_text(row.get("Name")),
+            "driverVersion": _clean_text(row.get("driverVersion")) or _clean_text(row.get("DriverVersion")),
+            "source": _clean_text(row.get("source")),
+            "vendorId": row.get("vendorId"),
+            "deviceId": row.get("deviceId"),
+            "adapterLuid": row.get("adapterLuid"),
             "dedicatedMemoryBytes": memory,
-            "usedMemoryBytes": dedicated_usage[index] if index < len(dedicated_usage) else None,
-            "sharedMemoryBytes": shared_usage[index] if index < len(shared_usage) else None,
+            "usedMemoryBytes": dedicated_used,
+            "sharedMemoryBytes": shared_used,
+            "gpuMemoryUsedBytes": gpu_memory_used,
+            "gpuMemoryTotalBytes": gpu_memory_total,
+            "dedicatedMemoryUsedBytes": dedicated_used,
+            "dedicatedMemoryTotalBytes": memory,
+            "dedicatedSystemMemoryBytes": dedicated_system,
+            "sharedMemoryUsedBytes": shared_used,
+            "sharedMemoryTotalBytes": row_shared_total,
             "usagePercent": usage_percent,
         })
     return gpus
@@ -788,8 +907,12 @@ def _disk_groups(disks: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 _item("usedBytes", disk.get("usedBytes"), "bytes"),
                 _item("freeBytes", disk.get("freeBytes"), "bytes"),
                 _item("usagePercent", disk.get("usagePercent"), "percent"),
+                _item("activeTimePercent", disk.get("activeTimePercent"), "percent"),
+                _item("capacityUsagePercent", disk.get("capacityUsagePercent"), "percent"),
                 _item("readBytesPerSecond", disk.get("readBytesPerSecond"), "bytesPerSecond"),
                 _item("writeBytesPerSecond", disk.get("writeBytesPerSecond"), "bytesPerSecond"),
+                _item("averageResponseTimeMs", disk.get("averageResponseTimeMs"), "ms"),
+                _item("queueLength", disk.get("queueLength"), "count"),
                 _item("diskType", disk.get("type")),
                 _item("model", disk.get("model")),
             ],
@@ -809,6 +932,8 @@ def _network_groups(networks: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 _item("connectionType", network.get("connectionType")),
                 _item("ipv4", network.get("ipv4")),
                 _item("ipv6", network.get("ipv6")),
+                _item("speedBitsPerSecond", network.get("speedBitsPerSecond"), "bitsPerSecond"),
+                _item("macAddress", network.get("macAddress")),
                 _item("model", network.get("model")),
                 _item("ssid", network.get("ssid")),
                 _item("signalStrengthDbm", network.get("signalStrengthDbm"), "dbm"),
@@ -830,6 +955,13 @@ def _gpu_groups(gpus: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 _item("dedicatedMemoryBytes", gpu.get("dedicatedMemoryBytes"), "bytes"),
                 _item("usedMemoryBytes", gpu.get("usedMemoryBytes"), "bytes"),
                 _item("sharedMemoryBytes", gpu.get("sharedMemoryBytes"), "bytes"),
+                _item("gpuMemoryUsedBytes", gpu.get("gpuMemoryUsedBytes"), "bytes"),
+                _item("gpuMemoryTotalBytes", gpu.get("gpuMemoryTotalBytes"), "bytes"),
+                _item("dedicatedMemoryUsedBytes", gpu.get("dedicatedMemoryUsedBytes"), "bytes"),
+                _item("dedicatedMemoryTotalBytes", gpu.get("dedicatedMemoryTotalBytes"), "bytes"),
+                _item("sharedMemoryUsedBytes", gpu.get("sharedMemoryUsedBytes"), "bytes"),
+                _item("sharedMemoryTotalBytes", gpu.get("sharedMemoryTotalBytes"), "bytes"),
+                _item("usagePercent", gpu.get("usagePercent"), "percent"),
             ],
         })
     return groups
@@ -864,9 +996,14 @@ def _sections(cpu: dict[str, Any], memory: dict[str, Any], disks: list[dict[str,
             _item("cachedBytes", memory.get("cachedBytes"), "bytes"),
             _item("committedBytes", memory.get("committedBytes"), "bytes"),
             _item("commitLimitBytes", memory.get("commitLimitBytes"), "bytes"),
+            _item("pagedPoolBytes", memory.get("pagedPoolBytes"), "bytes"),
+            _item("nonPagedPoolBytes", memory.get("nonPagedPoolBytes"), "bytes"),
+            _item("hardwareReservedBytes", memory.get("hardwareReservedBytes"), "bytes"),
             _item("usagePercent", memory.get("usagePercent"), "percent"),
+            _item("installedBytes", memory.get("installedBytes"), "bytes"),
             _item("speedMtPerSecond", memory.get("speedMtPerSecond"), "mtPerSecond"),
             _item("slotsUsed", memory.get("slotsUsed"), "count"),
+            _item("slotsTotal", memory.get("slotsTotal"), "count"),
             _item("formFactor", memory.get("formFactor")),
         ]),
         _section("windows.disks", [], _disk_groups(disks)),
@@ -906,6 +1043,17 @@ def _build_hardware_payload(
                 "usedBytes": memory.get("usedBytes"),
                 "availableBytes": memory.get("availableBytes"),
                 "usagePercent": memory.get("usagePercent"),
+                "cachedBytes": memory.get("cachedBytes"),
+                "committedBytes": memory.get("committedBytes"),
+                "commitLimitBytes": memory.get("commitLimitBytes"),
+                "pagedPoolBytes": memory.get("pagedPoolBytes"),
+                "nonPagedPoolBytes": memory.get("nonPagedPoolBytes"),
+                "hardwareReservedBytes": memory.get("hardwareReservedBytes"),
+                "installedBytes": memory.get("installedBytes"),
+                "speedMtPerSecond": memory.get("speedMtPerSecond"),
+                "slotsUsed": memory.get("slotsUsed"),
+                "slotsTotal": memory.get("slotsTotal"),
+                "formFactor": memory.get("formFactor"),
             },
             "disks": [
                 {
@@ -918,8 +1066,12 @@ def _build_hardware_payload(
                     "usedBytes": disk.get("usedBytes"),
                     "freeBytes": disk.get("freeBytes"),
                     "usagePercent": disk.get("usagePercent"),
+                    "activeTimePercent": disk.get("activeTimePercent"),
+                    "capacityUsagePercent": disk.get("capacityUsagePercent"),
                     "readBytesPerSecond": disk.get("readBytesPerSecond"),
                     "writeBytesPerSecond": disk.get("writeBytesPerSecond"),
+                    "averageResponseTimeMs": disk.get("averageResponseTimeMs"),
+                    "queueLength": disk.get("queueLength"),
                 }
                 for disk in disks
             ],
@@ -927,10 +1079,29 @@ def _build_hardware_payload(
                 {
                     "adapterName": network.get("adapterName"),
                     "ipv4": network.get("ipv4"),
+                    "ipv6": network.get("ipv6"),
                     "connectionType": network.get("connectionType"),
                     "model": network.get("model"),
+                    "speedBitsPerSecond": network.get("speedBitsPerSecond"),
+                    "macAddress": network.get("macAddress"),
+                    "ssid": network.get("ssid"),
+                    "signalStrengthDbm": network.get("signalStrengthDbm"),
                 }
                 for network in networks
+            ],
+            "gpus": [
+                {
+                    "model": gpu.get("model"),
+                    "driverVersion": gpu.get("driverVersion"),
+                    "gpuMemoryUsedBytes": gpu.get("gpuMemoryUsedBytes"),
+                    "gpuMemoryTotalBytes": gpu.get("gpuMemoryTotalBytes"),
+                    "dedicatedMemoryUsedBytes": gpu.get("dedicatedMemoryUsedBytes"),
+                    "dedicatedMemoryTotalBytes": gpu.get("dedicatedMemoryTotalBytes"),
+                    "sharedMemoryUsedBytes": gpu.get("sharedMemoryUsedBytes"),
+                    "sharedMemoryTotalBytes": gpu.get("sharedMemoryTotalBytes"),
+                    "usagePercent": gpu.get("usagePercent"),
+                }
+                for gpu in gpus
             ],
         },
         "cpu": cpu,
@@ -961,13 +1132,17 @@ def _collect_hardware_snapshot() -> dict[str, Any]:
 
 def _collect_cpu_quick() -> dict[str, Any]:
     freq = psutil.cpu_freq()
+    perf = native_cpu_perf.read_cpu_perf() if native_cpu_perf is not None else {}
     return {
         "model": platform.processor() or os.getenv("PROCESSOR_IDENTIFIER") or None,
         "sockets": 1,
         "cores": psutil.cpu_count(logical=False) or 1,
         "logicalProcessors": psutil.cpu_count(logical=True) or 1,
         "baseSpeedMhz": round(freq.max, 1) if freq and freq.max else None,
-        "currentSpeedMhz": round(freq.current, 1) if freq else None,
+        "currentSpeedMhz": _first_available(
+            perf.get("currentSpeedMhz"),
+            round(freq.current, 1) if freq else None,
+        ),
         "virtualization": None,
         "l2CacheBytes": None,
         "l3CacheBytes": None,
@@ -989,6 +1164,9 @@ def _collect_memory_quick() -> dict[str, Any]:
         "cachedBytes": perf.get("CacheBytes", getattr(mem, "cached", 0) or 0),
         "committedBytes": perf.get("CommittedBytes", mem.used + getattr(swap, "used", 0)),
         "commitLimitBytes": perf.get("CommitLimit", mem.total + getattr(swap, "total", 0)),
+        "pagedPoolBytes": perf.get("PoolPagedBytes"),
+        "nonPagedPoolBytes": perf.get("PoolNonpagedBytes"),
+        "hardwareReservedBytes": None,
     }
     if physical is not None:
         result.update(_collect_physical_memory())
@@ -1019,8 +1197,12 @@ def _collect_disks_quick() -> list[dict[str, Any]]:
             "usedBytes": usage.used,
             "freeBytes": usage.free,
             "usagePercent": round(usage.percent, 1),
+            "activeTimePercent": None,
+            "capacityUsagePercent": round(usage.percent, 1),
             "readBytesPerSecond": None,
             "writeBytesPerSecond": None,
+            "averageResponseTimeMs": None,
+            "queueLength": None,
             "type": None,
             "model": None,
         })
@@ -1063,17 +1245,38 @@ def _collect_networks_quick() -> list[dict[str, Any]]:
 
 
 def _collect_gpus_quick() -> list[dict[str, Any]]:
-    rows = _as_list(_get_cached_static("gpu_inventory"))
+    dxgi_rows = [row for row in _as_list(_get_cached_static("gpu_inventory_dxgi")) if isinstance(row, dict)]
+    wmi_rows = [row for row in _as_list(_get_cached_static("gpu_inventory_wmi")) if isinstance(row, dict)]
+    rows = _merge_gpu_inventory(dxgi_rows, wmi_rows)
     gpus = []
+    memory_total = psutil.virtual_memory().total
+    shared_memory_total = memory_total // 2 if memory_total else None
     for row in rows:
         if not isinstance(row, dict):
             continue
+        dedicated_total = _first_number(row.get("dedicatedMemoryBytes"), row.get("AdapterRAM"))
+        dedicated_system = _first_number(row.get("dedicatedSystemMemoryBytes"))
+        row_shared_total = _first_number(row.get("sharedMemoryTotalBytes")) or shared_memory_total
+        gpu_memory_total_parts = [
+            value for value in (dedicated_total, dedicated_system, row_shared_total) if value is not None
+        ]
         gpus.append({
-            "model": _clean_text(row.get("Name")),
-            "driverVersion": _clean_text(row.get("DriverVersion")),
-            "dedicatedMemoryBytes": _first_number(row.get("AdapterRAM")),
+            "model": _clean_text(row.get("model")) or _clean_text(row.get("Name")),
+            "driverVersion": _clean_text(row.get("driverVersion")) or _clean_text(row.get("DriverVersion")),
+            "source": _clean_text(row.get("source")),
+            "vendorId": row.get("vendorId"),
+            "deviceId": row.get("deviceId"),
+            "adapterLuid": row.get("adapterLuid"),
+            "dedicatedMemoryBytes": dedicated_total,
             "usedMemoryBytes": None,
             "sharedMemoryBytes": None,
+            "gpuMemoryUsedBytes": None,
+            "gpuMemoryTotalBytes": sum(gpu_memory_total_parts) if gpu_memory_total_parts else None,
+            "dedicatedMemoryUsedBytes": None,
+            "dedicatedMemoryTotalBytes": dedicated_total,
+            "dedicatedSystemMemoryBytes": dedicated_system,
+            "sharedMemoryUsedBytes": None,
+            "sharedMemoryTotalBytes": row_shared_total,
             "usagePercent": None,
         })
     return gpus

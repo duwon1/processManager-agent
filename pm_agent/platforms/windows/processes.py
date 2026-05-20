@@ -85,6 +85,16 @@ def _get_io_speed(proc: psutil.Process) -> tuple[int, int]:
         return 0, 0
 
 
+def _get_handle_count(proc: psutil.Process) -> int | None:
+    try:
+        num_handles = getattr(proc, "num_handles", None)
+        if callable(num_handles):
+            return int(num_handles())
+    except (psutil.AccessDenied, psutil.NoSuchProcess, AttributeError, OSError):
+        return None
+    return None
+
+
 def _prime_cpu_percent(processes: list[psutil.Process]) -> None:
     for proc in processes:
         try:
@@ -141,6 +151,7 @@ def _list_processes_psutil() -> list[dict[str, Any]]:
                 "disk_read_bytes_per_second": read_bps,
                 "disk_write_bytes_per_second": write_bps,
                 "thread_count": pinfo.get("num_threads") or 0,
+                "handle_count": _get_handle_count(proc),
                 "started_at": _format_started_at(pinfo.get("create_time")),
                 "cmdline": _format_cmdline(pinfo.get("cmdline")),
                 "exe": _truncate(pinfo.get("exe"), MAX_EXE_LENGTH),

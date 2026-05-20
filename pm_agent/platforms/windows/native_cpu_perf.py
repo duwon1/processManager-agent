@@ -1,4 +1,4 @@
-"""Windows memory performance counters through PDH."""
+"""CPU performance counters through the Windows PDH API."""
 from __future__ import annotations
 
 import ctypes
@@ -9,14 +9,12 @@ from threading import Lock
 ERROR_SUCCESS = 0
 PDH_INVALID_DATA = 0xC0000BC6
 PDH_CSTATUS_NEW_DATA = 1
-PDH_FMT_LARGE = 0x00000400
+PDH_FMT_DOUBLE = 0x00000200
 
 COUNTERS = {
-    "CacheBytes": r"\Memory\Cache Bytes",
-    "CommittedBytes": r"\Memory\Committed Bytes",
-    "CommitLimit": r"\Memory\Commit Limit",
-    "PoolPagedBytes": r"\Memory\Pool Paged Bytes",
-    "PoolNonpagedBytes": r"\Memory\Pool Nonpaged Bytes",
+    "utilityPercent": r"\Processor Information(_Total)\% Processor Utility",
+    "usagePercent": r"\Processor Information(_Total)\% Processor Time",
+    "currentSpeedMhz": r"\Processor Information(_Total)\Processor Frequency",
 }
 
 
@@ -75,7 +73,7 @@ def _status_code(status: int) -> int:
     return int(status) & 0xFFFFFFFF
 
 
-class PdhMemoryPerfSampler:
+class PdhCpuPerfSampler:
     def __init__(self) -> None:
         self._query = ctypes.c_void_p()
         self._counters: dict[str, ctypes.c_void_p] = {}
@@ -83,7 +81,7 @@ class PdhMemoryPerfSampler:
         self._unavailable = False
         self._lock = Lock()
 
-    def read_values(self) -> dict[str, int]:
+    def read_values(self) -> dict[str, float]:
         with self._lock:
             if self._unavailable:
                 return {}
@@ -95,18 +93,14 @@ class PdhMemoryPerfSampler:
                 self._close_unlocked()
                 return {}
 
-            values: dict[str, int] = {}
+            values: dict[str, float] = {}
             for name, counter in self._counters.items():
-                value = PDH_FMT_COUNTERVALUE()
-                counter_type = wintypes.DWORD(0)
-                status = _status_code(_pdh_get_formatted_counter_value(
-                    counter,
-                    PDH_FMT_LARGE,
-                    ctypes.byref(counter_type),
-                    ctypes.byref(value),
-                ))
-                if status == ERROR_SUCCESS and value.CStatus in (ERROR_SUCCESS, PDH_CSTATUS_NEW_DATA):
-                    values[name] = max(0, int(value.largeValue))
+                value = self._read_counter(counter)
+                if value is None:
+                    continue
+                if name.endswith("Percent"):
+                    value = max(0.0, min(value, 100.0))
+                values[name] = round(value, 1)
             return values
 
     def _initialize(self) -> bool:
@@ -135,6 +129,19 @@ class PdhMemoryPerfSampler:
         self._initialized = True
         return True
 
+    def _read_counter(self, counter: ctypes.c_void_p) -> float | None:
+        value = PDH_FMT_COUNTERVALUE()
+        counter_type = wintypes.DWORD(0)
+        status = _status_code(_pdh_get_formatted_counter_value(
+            counter,
+            PDH_FMT_DOUBLE,
+            ctypes.byref(counter_type),
+            ctypes.byref(value),
+        ))
+        if status == ERROR_SUCCESS and value.CStatus in (ERROR_SUCCESS, PDH_CSTATUS_NEW_DATA):
+            return float(value.doubleValue)
+        return None
+
     def _close_unlocked(self) -> None:
         if self._query:
             _pdh_close_query(self._query)
@@ -143,8 +150,8 @@ class PdhMemoryPerfSampler:
         self._initialized = False
 
 
-_sampler = PdhMemoryPerfSampler()
+_sampler = PdhCpuPerfSampler()
 
 
-def read_memory_perf() -> dict[str, int]:
+def read_cpu_perf() -> dict[str, float]:
     return _sampler.read_values()
