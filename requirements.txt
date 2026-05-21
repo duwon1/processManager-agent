@@ -3,3 +3,4 @@ uvicorn
 psutil
 httpx
 websockets
+pywinpty; platform_system == "Windows"

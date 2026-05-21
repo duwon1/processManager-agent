@@ -4,7 +4,7 @@ from __future__ import annotations
 from typing import Any
 
 from pm_agent.platforms.base import PlatformAdapter
-from pm_agent.platforms.windows import hardware, metrics, processes, services, uninstaller, updater
+from pm_agent.platforms.windows import hardware, metrics, processes, services, terminal, uninstaller, updater
 from pm_agent.platforms.windows.capabilities import WINDOWS_CAPABILITIES
 
 
@@ -50,22 +50,22 @@ class WindowsAdapter(PlatformAdapter):
         }
 
     def open_terminal(self, session_id: str, cols: int, rows: int) -> None:
-        return None
+        terminal.open_session(session_id, cols, rows)
 
     def write_terminal(self, session_id: str, data: str) -> None:
-        return None
+        terminal.write(session_id, data)
 
     def resize_terminal(self, session_id: str, cols: int, rows: int) -> None:
-        return None
+        terminal.resize(session_id, cols, rows)
 
     def close_terminal(self, session_id: str) -> None:
-        return None
+        terminal.close_session(session_id)
 
     def iter_terminal_queues(self) -> list[tuple[str, Any]]:
-        return []
+        return terminal.iter_queues()
 
     def cleanup_terminals(self) -> None:
-        return None
+        terminal.cleanup_all()
 
     async def self_update(self, agent_dir: str) -> tuple[bool, str]:
         return await updater.self_update(agent_dir)

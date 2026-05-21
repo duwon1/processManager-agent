@@ -537,7 +537,10 @@ async def run_agent(
 
                         # Terminal command handling
                         if cmd_type.startswith("terminal-"):
-                            _handle_terminal_command(payload, cmd_type, platform_adapter)
+                            try:
+                                _handle_terminal_command(payload, cmd_type, platform_adapter)
+                            except Exception as e:
+                                print(f"[에이전트] 터미널 명령 처리 오류: {e}")
                             continue
 
                         # ── kill 명령 처리 ──

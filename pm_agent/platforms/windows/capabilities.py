@@ -7,7 +7,7 @@ WINDOWS_CAPABILITIES = {
     "processKill": True,
     "serviceList": True,
     "serviceControl": True,
-    "terminal": False,
+    "terminal": True,
     "fileList": False,
     "hardwareDetail": True,
     "selfUpdate": True,
