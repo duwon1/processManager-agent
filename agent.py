@@ -18,6 +18,11 @@ SYSINFO_SUBSCRIPTION_ID = "sysinfo-request-channel"
 UPDATE_CHECK_INTERVAL_SECONDS = 60
 MONITORING_SEND_INTERVAL_SECONDS = 1
 PROCESS_SEND_INTERVAL_SECONDS = 1
+MONITORING_COLLECT_TIMEOUT_SECONDS = 8
+PROCESS_COLLECT_TIMEOUT_SECONDS = 8
+SERVICE_COLLECT_TIMEOUT_SECONDS = 25
+LOOP_FAILURE_EXIT_THRESHOLD = 5
+CONNECTION_FAILURE_EXIT_THRESHOLD = 6
 
 
 class _AgentShutdown(Exception):
@@ -26,6 +31,20 @@ class _AgentShutdown(Exception):
     def __init__(self, reason: str):
         super().__init__(reason)
         self.reason = reason
+
+
+async def _run_blocking(name: str, func, timeout: float):
+    try:
+        return await asyncio.wait_for(asyncio.to_thread(func), timeout=timeout)
+    except asyncio.TimeoutError as exc:
+        raise TimeoutError(f"{name} timed out after {timeout}s") from exc
+
+
+def _exit_for_watchdog(reason: str) -> None:
+    print(f"[agent] watchdog exit: {reason}")
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os._exit(1)
 
 
 def _hidden_subprocess_kwargs() -> dict:
@@ -105,10 +124,16 @@ async def run_agent(
     self_ip = platform_adapter.get_self_ip()
     update_lock = asyncio.Lock()
     print(f"[에이전트] STOMP 연결 시도: {url}")
+    connection_failures = 0
 
     while True:
         try:
-            async with websockets.connect(url) as websocket:
+            async with websockets.connect(
+                url,
+                open_timeout=15,
+                ping_interval=20,
+                ping_timeout=20,
+            ) as websocket:
                 # 등록된 노드는 agent-secret을 우선 사용하고, 최초 등록/재설치는 account-token을 사용합니다.
                 connect_headers = {
                     "accept-version": "1.1,1.2",
@@ -130,6 +155,7 @@ async def run_agent(
                 if not str(resp).startswith("CONNECTED"):
                     raise RuntimeError(f"STOMP CONNECT 실패: {resp}")
                 print("[에이전트] STOMP 연결 성공")
+                connection_failures = 0
 
                 # 에이전트 커맨드 채널 구독 (kill + 터미널 + 서비스 제어)
                 await websocket.send(stomp_frame(
@@ -239,43 +265,78 @@ async def run_agent(
 
                 async def send_monitoring_loop():
                     """시스템 메트릭을 1초 간격으로 전송합니다."""
+                    failures = 0
                     while True:
                         started_at = asyncio.get_running_loop().time()
-                        data = platform_adapter.collect_metrics()
-                        await websocket.send(stomp_frame(
-                            "SEND",
-                            {"destination": "/app/monitoring", "content-type": "application/json"},
-                            json.dumps(data),
-                        ))
+                        try:
+                            data = await _run_blocking(
+                                "monitoring collection",
+                                platform_adapter.collect_metrics,
+                                MONITORING_COLLECT_TIMEOUT_SECONDS,
+                            )
+                            await websocket.send(stomp_frame(
+                                "SEND",
+                                {"destination": "/app/monitoring", "content-type": "application/json"},
+                                json.dumps(data),
+                            ))
+                            failures = 0
+                        except Exception as e:
+                            failures += 1
+                            print(f"[에이전트] 모니터링 전송 오류({failures}/{LOOP_FAILURE_EXIT_THRESHOLD}): {e}")
+                            if failures >= LOOP_FAILURE_EXIT_THRESHOLD:
+                                _exit_for_watchdog("monitoring loop stalled")
                         elapsed = asyncio.get_running_loop().time() - started_at
                         await asyncio.sleep(max(0, MONITORING_SEND_INTERVAL_SECONDS - elapsed))
 
                 async def send_process_loop():
                     """프로세스 목록을 1초 간격으로 전송합니다."""
+                    failures = 0
                     while True:
                         started_at = asyncio.get_running_loop().time()
-                        data = platform_adapter.list_processes()
-                        await websocket.send(stomp_frame(
-                            "SEND",
-                            {"destination": "/app/process", "content-type": "application/json"},
-                            json.dumps(data),
-                        ))
+                        try:
+                            data = await _run_blocking(
+                                "process collection",
+                                platform_adapter.list_processes,
+                                PROCESS_COLLECT_TIMEOUT_SECONDS,
+                            )
+                            await websocket.send(stomp_frame(
+                                "SEND",
+                                {"destination": "/app/process", "content-type": "application/json"},
+                                json.dumps(data),
+                            ))
+                            failures = 0
+                        except Exception as e:
+                            failures += 1
+                            print(f"[에이전트] 프로세스 전송 오류({failures}/{LOOP_FAILURE_EXIT_THRESHOLD}): {e}")
+                            if failures >= LOOP_FAILURE_EXIT_THRESHOLD:
+                                _exit_for_watchdog("process loop stalled")
                         elapsed = asyncio.get_running_loop().time() - started_at
                         await asyncio.sleep(max(0, PROCESS_SEND_INTERVAL_SECONDS - elapsed))
 
                 async def send_service_loop():
                     """서비스 목록을 10초 간격으로 전송합니다."""
+                    failures = 0
                     while True:
+                        started_at = asyncio.get_running_loop().time()
                         try:
-                            svc_list = platform_adapter.list_services()
+                            svc_list = await _run_blocking(
+                                "service collection",
+                                platform_adapter.list_services,
+                                SERVICE_COLLECT_TIMEOUT_SECONDS,
+                            )
                             await websocket.send(stomp_frame(
                                 "SEND",
                                 {"destination": "/app/service", "content-type": "application/json"},
                                 json.dumps(svc_list),
                             ))
+                            failures = 0
                         except Exception as e:
-                            print(f"[에이전트] 서비스 목록 전송 오류: {e}")
-                        await asyncio.sleep(10)
+                            failures += 1
+                            print(f"[에이전트] 서비스 목록 전송 오류({failures}/{LOOP_FAILURE_EXIT_THRESHOLD}): {e}")
+                            if failures >= LOOP_FAILURE_EXIT_THRESHOLD:
+                                _exit_for_watchdog("service loop stalled")
+                        elapsed = asyncio.get_running_loop().time() - started_at
+                        await asyncio.sleep(max(0, 10 - elapsed))
 
                 async def send_terminal_output_loop():
                     """모든 활성 터미널 세션의 PTY 출력을 STOMP으로 전송합니다."""
@@ -508,7 +569,11 @@ async def run_agent(
                             }),
                         ))
 
-                        fresh = platform_adapter.list_processes()
+                        fresh = await _run_blocking(
+                            "process refresh",
+                            platform_adapter.list_processes,
+                            PROCESS_COLLECT_TIMEOUT_SECONDS,
+                        )
                         await websocket.send(stomp_frame(
                             "SEND",
                             {"destination": "/app/process", "content-type": "application/json"},
@@ -534,7 +599,13 @@ async def run_agent(
                     os._exit(0)
 
         except Exception as e:
-            print(f"[에이전트] 연결 에러 (5초 후 재시도): {e}")
+            connection_failures += 1
+            print(
+                f"[에이전트] 연결 에러 "
+                f"({connection_failures}/{CONNECTION_FAILURE_EXIT_THRESHOLD}, 5초 후 재시도): {e}"
+            )
+            if connection_failures >= CONNECTION_FAILURE_EXIT_THRESHOLD:
+                _exit_for_watchdog("repeated websocket connection failures")
             platform_adapter.cleanup_terminals()
             await asyncio.sleep(5)
 
