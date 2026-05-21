@@ -49,8 +49,8 @@ class WindowsAdapter(PlatformAdapter):
             "error": "Windows 파일 조회는 아직 지원하지 않습니다.",
         }
 
-    def open_terminal(self, session_id: str, cols: int, rows: int) -> None:
-        terminal.open_session(session_id, cols, rows)
+    def open_terminal(self, session_id: str, cols: int, rows: int, shell: str | None = None) -> None:
+        terminal.open_session(session_id, cols, rows, shell)
 
     def write_terminal(self, session_id: str, data: str) -> None:
         terminal.write(session_id, data)

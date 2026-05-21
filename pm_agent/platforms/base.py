@@ -43,7 +43,7 @@ class PlatformAdapter(ABC):
         """지정 경로의 파일/디렉토리 목록을 반환합니다."""
 
     @abstractmethod
-    def open_terminal(self, session_id: str, cols: int, rows: int) -> None:
+    def open_terminal(self, session_id: str, cols: int, rows: int, shell: str | None = None) -> None:
         """터미널 세션을 엽니다."""
 
     @abstractmethod

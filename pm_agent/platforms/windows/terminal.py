@@ -33,7 +33,13 @@ class WindowsTerminalManager:
         self._sessions: dict[str, dict[str, Any]] = {}
         self._lock = threading.Lock()
 
-    def open_session(self, session_id: str, cols: int = DEFAULT_COLS, rows: int = DEFAULT_ROWS) -> None:
+    def open_session(
+        self,
+        session_id: str,
+        cols: int = DEFAULT_COLS,
+        rows: int = DEFAULT_ROWS,
+        shell: str | None = None,
+    ) -> None:
         if PtyProcess is None:
             raise RuntimeError(f"pywinpty is required for Windows terminal support: {_IMPORT_ERROR}")
 
@@ -44,7 +50,7 @@ class WindowsTerminalManager:
             previous = self._sessions.pop(session_id, None)
         self._close_session(previous)
 
-        command = _shell_command()
+        command = _shell_command(shell)
         env = os.environ.copy()
         env.setdefault("TERM", "xterm-256color")
         env.setdefault("PYTHONIOENCODING", "utf-8")
@@ -183,10 +189,16 @@ def _home_directory() -> str:
     return str(home if home.exists() else Path.cwd())
 
 
-def _shell_command() -> list[str]:
+def _shell_command(shell: str | None = None) -> list[str]:
     configured = os.getenv("TERMINAL_SHELL", "").strip()
-    if configured:
+    requested = str(shell or "").strip()
+    if not requested and configured:
         return shlex.split(configured, posix=False)
+    requested = _normalize_shell(requested)
+
+    if requested == "cmd":
+        cmd = shutil.which("cmd.exe") or "cmd.exe"
+        return [cmd, "/K", "chcp 65001 > nul"]
 
     powershell = shutil.which("pwsh.exe") or shutil.which("powershell.exe")
     if powershell:
@@ -208,11 +220,18 @@ def _shell_command() -> list[str]:
     return [cmd, "/K", "chcp 65001 > nul"]
 
 
+def _normalize_shell(shell: str | None) -> str:
+    normalized = str(shell or "").strip().lower()
+    if normalized in {"cmd", "cmd.exe"}:
+        return "cmd"
+    return "powershell"
+
+
 terminal_manager = WindowsTerminalManager()
 
 
-def open_session(session_id: str, cols: int, rows: int) -> None:
-    terminal_manager.open_session(session_id, cols, rows)
+def open_session(session_id: str, cols: int, rows: int, shell: str | None = None) -> None:
+    terminal_manager.open_session(session_id, cols, rows, shell)
 
 
 def write(session_id: str, data: str) -> None:

@@ -38,7 +38,7 @@ class LinuxAdapter(PlatformAdapter):
     def list_files(self, path: str) -> dict[str, Any]:
         return filesystem.list_files(path)
 
-    def open_terminal(self, session_id: str, cols: int, rows: int) -> None:
+    def open_terminal(self, session_id: str, cols: int, rows: int, shell: str | None = None) -> None:
         terminal.open_session(session_id, cols, rows)
 
     def write_terminal(self, session_id: str, data: str) -> None:

@@ -618,7 +618,12 @@ def _handle_terminal_command(payload: dict, cmd_type: str, platform_adapter) -> 
     session_id = payload.get("sessionId", "")
 
     if cmd_type == "terminal-open":
-        platform_adapter.open_terminal(session_id, payload.get("cols", 80), payload.get("rows", 24))
+        platform_adapter.open_terminal(
+            session_id,
+            payload.get("cols", 80),
+            payload.get("rows", 24),
+            payload.get("shell"),
+        )
     elif cmd_type == "terminal-input":
         platform_adapter.write_terminal(session_id, payload.get("data", ""))
     elif cmd_type == "terminal-resize":
