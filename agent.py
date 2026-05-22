@@ -22,6 +22,7 @@ PROCESS_SEND_INTERVAL_SECONDS = 1
 MONITORING_COLLECT_TIMEOUT_SECONDS = 8
 PROCESS_COLLECT_TIMEOUT_SECONDS = 8
 SERVICE_COLLECT_TIMEOUT_SECONDS = 25
+DEVICE_MANAGER_COLLECT_TIMEOUT_SECONDS = 35
 LOOP_FAILURE_EXIT_THRESHOLD = 5
 CONNECTION_FAILURE_EXIT_THRESHOLD = 6
 
@@ -438,19 +439,47 @@ async def run_agent(
                         if destination == f"/topic/agent.device-manager-request.{agent_id}":
                             if not _targets_this_agent(payload, destination, agent_id, hostname):
                                 continue
+                            requested_node_id = payload.get("nodeId")
                             try:
-                                loop = asyncio.get_event_loop()
-                                requested_node_id = payload.get("nodeId")
-                                info = await loop.run_in_executor(None, platform_adapter.collect_device_manager)
+                                info = await _run_blocking(
+                                    "device manager collection",
+                                    platform_adapter.collect_device_manager,
+                                    DEVICE_MANAGER_COLLECT_TIMEOUT_SECONDS,
+                                )
+                                if not isinstance(info, dict):
+                                    raise RuntimeError("device manager collector returned invalid payload")
                                 info["nodeId"] = requested_node_id
+                                print("[에이전트] 장치 관리자 정보 전송 완료")
+                            except Exception as e:
+                                print(f"[에이전트] 장치 관리자 정보 수집 오류: {e}")
+                                info = {
+                                    "schemaVersion": 1,
+                                    "supported": False,
+                                    "osType": os_type,
+                                    "nodeId": requested_node_id,
+                                    "message": f"장치 관리자 정보 수집 실패: {str(e)[:300]}",
+                                    "summary": {
+                                        "totalDevices": 0,
+                                        "problemDevices": 0,
+                                        "categoryCount": 0,
+                                        "gpuCount": 0,
+                                        "networkAdapterCount": 0,
+                                    },
+                                    "devices": [],
+                                    "categories": [],
+                                    "cpu": [],
+                                    "baseboard": {},
+                                    "gpus": [],
+                                    "networkAdapters": [],
+                                }
+                            try:
                                 await websocket.send(stomp_frame(
                                     "SEND",
                                     {"destination": "/app/device-manager", "content-type": "application/json"},
                                     json.dumps(info),
                                 ))
-                                print("[에이전트] 장치 관리자 정보 전송 완료")
-                            except Exception as e:
-                                print(f"[에이전트] 장치 관리자 정보 수집 오류: {e}")
+                            except Exception as send_error:
+                                print(f"[에이전트] 장치 관리자 정보 전송 오류: {send_error}")
                             continue
 
                         if not _targets_this_agent(payload, destination, agent_id, hostname):

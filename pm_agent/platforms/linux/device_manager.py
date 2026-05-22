@@ -20,6 +20,7 @@ SCHEMA_VERSION = 1
 NA = "N/A"
 MAX_UDEV_DEVICES = 700
 MAX_SYS_BUS_DEVICES = 350
+MAX_TEXT_VALUE_LENGTH = 500
 
 LINUX_CATEGORY_LABELS = {
     "Processor": "프로세서",
@@ -129,6 +130,8 @@ def _clean(value: Any, default: str = NA) -> Any:
         return default
     if isinstance(value, str):
         text = value.strip()
+        if len(text) > MAX_TEXT_VALUE_LENGTH:
+            return text[:MAX_TEXT_VALUE_LENGTH] + "..."
         return text if text else default
     return value
 
@@ -876,12 +879,26 @@ def _deduplicate_devices(devices: list[dict[str, Any]]) -> list[dict[str, Any]]:
     result = []
     seen = set()
     for device in devices:
-        key = _device_key_value(device)
-        if not key or key in seen:
+        keys = [
+            str(device.get("pnpDeviceId") or "").lower(),
+            str(device.get("deviceId") or "").lower(),
+            str(device.get("sysPath") or "").lower(),
+        ]
+        keys = [key for key in keys if key and key != NA.lower()]
+        if not keys:
+            keys = [_device_key_value(device)]
+        if any(key in seen for key in keys):
             continue
-        seen.add(key)
+        seen.update(keys)
         result.append(device)
     return result
+
+
+def _collect_source(label: str, collector) -> tuple[list[dict[str, Any]], str | None]:
+    try:
+        return collector(), None
+    except Exception as exc:
+        return [], f"{label}: {str(exc)[:160]}"
 
 
 def _build_categories(devices: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -954,18 +971,26 @@ def _core_networks(devices: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 
 def collect_device_manager() -> dict[str, Any]:
-    cpu = _collect_cpu_devices()
-    devices = _deduplicate_devices([
-        *cpu,
-        *_collect_pci_devices(),
-        *_collect_usb_devices(),
-        *_collect_disk_devices(),
-        *_collect_network_devices(),
-        *_collect_power_devices(),
-        *_collect_input_devices(),
-        *_collect_udev_devices(),
-        *_collect_sys_bus_devices(),
-    ])
+    devices = []
+    errors = []
+    for label, collector in (
+        ("cpu", _collect_cpu_devices),
+        ("pci", _collect_pci_devices),
+        ("usb", _collect_usb_devices),
+        ("disk", _collect_disk_devices),
+        ("network", _collect_network_devices),
+        ("power", _collect_power_devices),
+        ("input", _collect_input_devices),
+        ("udev", _collect_udev_devices),
+        ("sysbus", _collect_sys_bus_devices),
+    ):
+        rows, error = _collect_source(label, collector)
+        devices.extend(rows)
+        if error:
+            errors.append(error)
+
+    devices = _deduplicate_devices(devices)
+    cpu = [device for device in devices if device.get("category") == "Processor"]
     categories = _build_categories(devices)
     problem_devices = [device for device in devices if device.get("hasProblem")]
     gpus = _core_gpus(devices)
@@ -989,4 +1014,5 @@ def collect_device_manager() -> dict[str, Any]:
         "networkAdapters": network_adapters,
         "categories": categories,
         "devices": devices,
+        "error": "; ".join(errors) if errors else None,
     }
