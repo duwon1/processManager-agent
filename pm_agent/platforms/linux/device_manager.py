@@ -18,6 +18,8 @@ from system import hardware as legacy_hardware
 
 SCHEMA_VERSION = 1
 NA = "N/A"
+MAX_UDEV_DEVICES = 700
+MAX_SYS_BUS_DEVICES = 350
 
 LINUX_CATEGORY_LABELS = {
     "Processor": "프로세서",
@@ -34,6 +36,67 @@ LINUX_CATEGORY_LABELS = {
     "Keyboard": "키보드",
     "Mouse": "마우스 및 기타 포인팅 장치",
     "HIDClass": "휴먼 인터페이스 장치",
+    "AudioEndpoint": "오디오 입력 및 출력",
+    "Biometric": "생체 인식 장치",
+    "Camera": "카메라",
+    "CDROM": "DVD/CD-ROM 드라이브",
+    "Computer": "컴퓨터",
+    "Firmware": "펌웨어",
+    "Image": "이미징 장치",
+    "Modem": "모뎀",
+    "Monitor": "모니터",
+    "Ports": "포트(COM & LPT)",
+    "Printer": "프린터",
+    "PrintQueue": "인쇄 큐",
+    "SCSIAdapter": "SCSI 어댑터",
+    "Sensor": "센서",
+    "SmartCardReader": "스마트 카드 판독기",
+    "SoftwareComponent": "소프트웨어 구성 요소",
+    "SoftwareDevice": "소프트웨어 장치",
+    "USBDevice": "범용 직렬 버스 장치",
+    "Volume": "저장소 볼륨",
+    "WPD": "휴대용 장치",
+}
+
+SYS_BUS_CATEGORY = {
+    "acpi": "System",
+    "auxiliary": "SoftwareComponent",
+    "bluetooth": "Bluetooth",
+    "clockevents": "System",
+    "clocksource": "System",
+    "container": "System",
+    "cpu": "Processor",
+    "dmi": "Computer",
+    "edac": "System",
+    "event_source": "System",
+    "gpio": "System",
+    "hid": "HIDClass",
+    "i2c": "System",
+    "isa": "System",
+    "machinecheck": "System",
+    "mdio_bus": "Net",
+    "memory": "System",
+    "mipi-dsi": "Display",
+    "mmc": "DiskDrive",
+    "nd": "DiskDrive",
+    "nvmem": "Firmware",
+    "nvme": "HDC",
+    "pci": "System",
+    "pci_express": "System",
+    "platform": "System",
+    "pnp": "System",
+    "rapidio": "System",
+    "scsi": "SCSIAdapter",
+    "sdio": "System",
+    "serio": "HIDClass",
+    "spi": "System",
+    "tee": "SecurityDevices",
+    "thunderbolt": "USB",
+    "usb": "USBDevice",
+    "usb-serial": "Ports",
+    "virtio": "System",
+    "vmbus": "System",
+    "wmi": "System",
 }
 
 
@@ -107,6 +170,141 @@ def _extract_last_id(value: str | None) -> str:
 
 def _category_label(category: str) -> str:
     return LINUX_CATEGORY_LABELS.get(category, category or "기타 장치")
+
+
+def _decode_udev_text(value: str | None) -> str | None:
+    if not value:
+        return None
+    text = value.replace("\\x20", " ").replace("\\x2d", "-").replace("_", " ").strip()
+    return text or None
+
+
+def _sys_driver_name(sys_path: str | None) -> str | None:
+    if not sys_path:
+        return None
+    driver_path = os.path.join(sys_path, "driver")
+    try:
+        if os.path.islink(driver_path):
+            return os.path.basename(os.path.realpath(driver_path)) or None
+    except Exception:
+        return None
+    return None
+
+
+def _sys_attr(sys_path: str | None, *names: str) -> str | None:
+    if not sys_path:
+        return None
+    for name in names:
+        value = _read_text(os.path.join(sys_path, name))
+        if value:
+            return value
+    return None
+
+
+def _device_key_value(device: dict[str, Any]) -> str:
+    return str(device.get("pnpDeviceId") or device.get("deviceId") or device.get("name") or "").lower()
+
+
+def _udev_property(props: dict[str, str], *names: str) -> str | None:
+    for name in names:
+        value = _decode_udev_text(props.get(name))
+        if value:
+            return value
+    return None
+
+
+def _udev_name(props: dict[str, str], devname: str | None, sys_path: str | None) -> str:
+    return (
+        _udev_property(
+            props,
+            "ID_MODEL_FROM_DATABASE",
+            "ID_MODEL",
+            "ID_NAME",
+            "ID_NET_NAME_ONBOARD",
+            "ID_NET_NAME_SLOT",
+            "ID_NET_NAME_PATH",
+            "ID_FS_LABEL",
+            "NAME",
+        )
+        or _sys_attr(sys_path, "product", "model", "name", "type", "modalias")
+        or devname
+        or (os.path.basename(sys_path) if sys_path else None)
+        or NA
+    )
+
+
+def _udev_manufacturer(props: dict[str, str], sys_path: str | None) -> str:
+    return (
+        _udev_property(props, "ID_VENDOR_FROM_DATABASE", "ID_VENDOR", "ID_USB_VENDOR", "ID_NET_DRIVER")
+        or _sys_attr(sys_path, "manufacturer", "vendor")
+        or NA
+    )
+
+
+def _udev_status(sys_path: str | None) -> str:
+    state = _sys_attr(sys_path, "state", "operstate")
+    if state:
+        return state
+    return "OK" if sys_path and os.path.exists(sys_path) else NA
+
+
+def _udev_category(props: dict[str, str], sys_path: str | None, name: str) -> str:
+    subsystem = (props.get("SUBSYSTEM") or "").lower()
+    devtype = (props.get("DEVTYPE") or "").lower()
+    source = f"{subsystem} {devtype} {name} {props.get('ID_INPUT_KEYBOARD', '')} {props.get('ID_INPUT_MOUSE', '')}".lower()
+
+    if props.get("ID_INPUT_KEYBOARD") == "1":
+        return "Keyboard"
+    if props.get("ID_INPUT_MOUSE") == "1":
+        return "Mouse"
+    if props.get("ID_INPUT_TOUCHPAD") == "1" or props.get("ID_INPUT_TOUCHSCREEN") == "1" or props.get("ID_INPUT") == "1":
+        return "HIDClass"
+    if props.get("ID_CDROM") == "1" or devtype == "disk" and props.get("ID_CDROM"):
+        return "CDROM"
+    if props.get("ID_DRIVE_FLASH_SD") == "1" or props.get("ID_DRIVE_THUMB") == "1":
+        return "DiskDrive"
+    if props.get("ID_NET_DRIVER") or subsystem == "net":
+        return "Net"
+    if props.get("ID_BUS") == "usb":
+        return "USBDevice"
+
+    if subsystem in {"block", "bdi"}:
+        return "Volume" if devtype == "partition" else "DiskDrive"
+    if subsystem in {"drm", "graphics", "backlight"}:
+        return "Display"
+    if subsystem in {"sound"}:
+        return "AudioEndpoint"
+    if subsystem in {"input", "hid", "i2c"} and any(term in source for term in ("keyboard", "kbd")):
+        return "Keyboard"
+    if subsystem in {"input", "hid", "i2c"} and "mouse" in source:
+        return "Mouse"
+    if subsystem in {"input", "hid", "i2c", "serio"}:
+        return "HIDClass"
+    if subsystem in {"video4linux", "media"}:
+        return "Camera" if "camera" in source or "webcam" in source else "Image"
+    if subsystem in {"bluetooth"} or "bluetooth" in source:
+        return "Bluetooth"
+    if subsystem in {"tty"}:
+        return "Ports"
+    if subsystem in {"usb", "usb-serial"}:
+        return "USBDevice"
+    if subsystem in {"nvme", "scsi"}:
+        return "HDC"
+    if subsystem in {"power_supply"}:
+        return "Battery"
+    if subsystem in {"dmi", "cpu"}:
+        return "Computer" if subsystem == "dmi" else "Processor"
+    if subsystem in {"tpm", "tee"}:
+        return "SecurityDevices"
+    if subsystem in {"firmware", "nvmem"}:
+        return "Firmware"
+    if subsystem in {"leds", "hwmon", "thermal", "watchdog", "rtc", "regulator"}:
+        return "System"
+    if sys_path:
+        for bus, category in SYS_BUS_CATEGORY.items():
+            if f"/bus/{bus}/" in sys_path:
+                return category
+    return "SoftwareDevice" if subsystem in {"module", "drivers"} else "System"
 
 
 def _kernel_driver_fields(driver: str | None, modules: str | None = None) -> dict[str, Any]:
@@ -557,11 +755,128 @@ def _collect_input_devices() -> list[dict[str, Any]]:
     return devices
 
 
+def _parse_udev_export_db() -> list[dict[str, Any]]:
+    blocks = []
+    current: dict[str, Any] = {"properties": {}, "symlinks": []}
+    for raw_line in _run(["udevadm", "info", "--export-db"], timeout=10).splitlines():
+        line = raw_line.strip()
+        if not line:
+            if current.get("path") or current.get("properties"):
+                blocks.append(current)
+            current = {"properties": {}, "symlinks": []}
+            continue
+        prefix, _, value = line.partition(": ")
+        if prefix == "P":
+            current["path"] = value
+        elif prefix == "N":
+            current["devname"] = f"/dev/{value}" if not value.startswith("/dev/") else value
+        elif prefix == "S":
+            current.setdefault("symlinks", []).append(value)
+        elif prefix == "E" and "=" in value:
+            key, prop_value = value.split("=", 1)
+            current.setdefault("properties", {})[key] = prop_value
+    if current.get("path") or current.get("properties"):
+        blocks.append(current)
+    return blocks
+
+
+def _collect_udev_devices() -> list[dict[str, Any]]:
+    devices = []
+    for block in _parse_udev_export_db():
+        if len(devices) >= MAX_UDEV_DEVICES:
+            break
+        props = block.get("properties") if isinstance(block.get("properties"), dict) else {}
+        devpath = str(block.get("path") or props.get("DEVPATH") or "")
+        if not devpath:
+            continue
+        sys_path = devpath if devpath.startswith("/sys/") else f"/sys{devpath}"
+        devname = block.get("devname") or props.get("DEVNAME")
+        name = _udev_name(props, str(devname) if devname else None, sys_path)
+        if name == NA and not devname:
+            continue
+        category = _udev_category(props, sys_path, name)
+        driver = (
+            _udev_property(props, "DRIVER", "ID_NET_DRIVER", "ID_USB_DRIVER")
+            or _sys_driver_name(sys_path)
+        )
+        symlinks = block.get("symlinks") if isinstance(block.get("symlinks"), list) else []
+        vendor = _udev_manufacturer(props, sys_path)
+        product_id = _udev_property(props, "ID_MODEL_ID", "ID_USB_MODEL_ID")
+        vendor_id = _udev_property(props, "ID_VENDOR_ID", "ID_USB_VENDOR_ID")
+        devices.append(_device(
+            name=name,
+            category=category,
+            manufacturer=vendor,
+            status=_udev_status(sys_path),
+            device_id=devname or devpath,
+            pnp_device_id=f"UDEV\\{devpath}",
+            description=_udev_property(props, "ID_MODEL_FROM_DATABASE", "ID_USB_INTERFACES", "MODALIAS") or props.get("SUBSYSTEM"),
+            service=driver,
+            bus=_udev_property(props, "ID_BUS") or props.get("SUBSYSTEM"),
+            subsystem=props.get("SUBSYSTEM"),
+            devtype=props.get("DEVTYPE"),
+            devname=devname,
+            sysPath=sys_path,
+            modalias=props.get("MODALIAS"),
+            idPath=_udev_property(props, "ID_PATH", "ID_PATH_TAG"),
+            serialNumber=_udev_property(props, "ID_SERIAL_SHORT", "ID_SERIAL"),
+            vendorId=vendor_id,
+            productId=product_id,
+            filesystem=_udev_property(props, "ID_FS_TYPE"),
+            filesystemLabel=_udev_property(props, "ID_FS_LABEL"),
+            symlinks=", ".join(str(item) for item in symlinks[:8]) if symlinks else NA,
+        ))
+    return devices
+
+
+def _collect_sys_bus_devices() -> list[dict[str, Any]]:
+    root = "/sys/bus"
+    try:
+        bus_names = sorted(os.listdir(root))
+    except Exception:
+        return []
+
+    devices = []
+    for bus in bus_names:
+        category = SYS_BUS_CATEGORY.get(bus)
+        if not category:
+            continue
+        bus_dir = os.path.join(root, bus, "devices")
+        try:
+            entries = sorted(os.listdir(bus_dir))
+        except Exception:
+            continue
+        for entry in entries:
+            if len(devices) >= MAX_SYS_BUS_DEVICES:
+                return devices
+            sys_path = os.path.join(bus_dir, entry)
+            real_path = os.path.realpath(sys_path)
+            driver = _sys_driver_name(real_path)
+            name = (
+                _sys_attr(real_path, "product", "model", "name", "type", "modalias")
+                or entry
+            )
+            devices.append(_device(
+                name=name,
+                category=category,
+                manufacturer=_sys_attr(real_path, "manufacturer", "vendor"),
+                status=_udev_status(real_path),
+                device_id=real_path,
+                pnp_device_id=f"SYSBUS\\{bus}\\{entry}",
+                description=f"Linux {bus} bus device",
+                service=driver,
+                bus=bus,
+                sysPath=real_path,
+                modalias=_sys_attr(real_path, "modalias"),
+            ))
+    return devices
+
+
 def _deduplicate_devices(devices: list[dict[str, Any]]) -> list[dict[str, Any]]:
     result = []
     seen = set()
     for device in devices:
-        key = str(device.get("pnpDeviceId") or device.get("deviceId") or device.get("name")).lower()
+        key = _device_key_value(device)
         if not key or key in seen:
             continue
         seen.add(key)
@@ -648,6 +963,8 @@ def collect_device_manager() -> dict[str, Any]:
         *_collect_network_devices(),
         *_collect_power_devices(),
         *_collect_input_devices(),
+        *_collect_udev_devices(),
+        *_collect_sys_bus_devices(),
     ])
     categories = _build_categories(devices)
     problem_devices = [device for device in devices if device.get("hasProblem")]
