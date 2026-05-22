@@ -4,7 +4,7 @@ from __future__ import annotations
 from typing import Any
 
 from pm_agent.platforms.base import PlatformAdapter
-from pm_agent.platforms.linux import filesystem, hardware, metrics, processes, security, services, terminal, updater, uninstaller
+from pm_agent.platforms.linux import device_manager, filesystem, hardware, metrics, processes, security, services, terminal, updater, uninstaller
 from pm_agent.platforms.linux.capabilities import LINUX_CAPABILITIES
 
 
@@ -34,6 +34,9 @@ class LinuxAdapter(PlatformAdapter):
 
     def collect_hardware(self) -> dict[str, Any]:
         return hardware.collect_hardware()
+
+    def collect_device_manager(self) -> dict[str, Any]:
+        return device_manager.collect_device_manager()
 
     def list_files(self, path: str) -> dict[str, Any]:
         return filesystem.list_files(path)
