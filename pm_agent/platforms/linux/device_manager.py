@@ -18,8 +18,6 @@ from system import hardware as legacy_hardware
 
 SCHEMA_VERSION = 1
 NA = "N/A"
-MAX_UDEV_DEVICES = 700
-MAX_SYS_BUS_DEVICES = 350
 MAX_TEXT_VALUE_LENGTH = 500
 
 LINUX_CATEGORY_LABELS = {
@@ -98,6 +96,30 @@ SYS_BUS_CATEGORY = {
     "virtio": "System",
     "vmbus": "System",
     "wmi": "System",
+}
+
+UDEV_VISIBLE_SUBSYSTEMS = {
+    "backlight",
+    "block",
+    "bluetooth",
+    "cpu",
+    "dmi",
+    "drm",
+    "graphics",
+    "hid",
+    "input",
+    "media",
+    "net",
+    "nvme",
+    "power_supply",
+    "scsi",
+    "sound",
+    "tee",
+    "tpm",
+    "tty",
+    "usb",
+    "usb-serial",
+    "video4linux",
 }
 
 
@@ -308,6 +330,21 @@ def _udev_category(props: dict[str, str], sys_path: str | None, name: str) -> st
             if f"/bus/{bus}/" in sys_path:
                 return category
     return "SoftwareDevice" if subsystem in {"module", "drivers"} else "System"
+
+
+def _include_udev_device(props: dict[str, str], category: str) -> bool:
+    subsystem = (props.get("SUBSYSTEM") or "").lower()
+    devtype = (props.get("DEVTYPE") or "").lower()
+    if subsystem not in UDEV_VISIBLE_SUBSYSTEMS and not props.get("ID_BUS"):
+        return False
+    if category in {"System", "SoftwareDevice"}:
+        return False
+    if subsystem == "block" and devtype not in {"disk", "partition"}:
+        return False
+    if subsystem == "tty":
+        devname = (props.get("DEVNAME") or "").lower()
+        return devname.startswith("/dev/ttyusb") or devname.startswith("/dev/ttyacm") or devname.startswith("/dev/serial")
+    return True
 
 
 def _kernel_driver_fields(driver: str | None, modules: str | None = None) -> dict[str, Any]:
@@ -786,8 +823,6 @@ def _parse_udev_export_db() -> list[dict[str, Any]]:
 def _collect_udev_devices() -> list[dict[str, Any]]:
     devices = []
     for block in _parse_udev_export_db():
-        if len(devices) >= MAX_UDEV_DEVICES:
-            break
         props = block.get("properties") if isinstance(block.get("properties"), dict) else {}
         devpath = str(block.get("path") or props.get("DEVPATH") or "")
         if not devpath:
@@ -798,6 +833,8 @@ def _collect_udev_devices() -> list[dict[str, Any]]:
         if name == NA and not devname:
             continue
         category = _udev_category(props, sys_path, name)
+        if not _include_udev_device(props, category):
+            continue
         driver = (
             _udev_property(props, "DRIVER", "ID_NET_DRIVER", "ID_USB_DRIVER")
             or _sys_driver_name(sys_path)
@@ -829,49 +866,6 @@ def _collect_udev_devices() -> list[dict[str, Any]]:
             filesystemLabel=_udev_property(props, "ID_FS_LABEL"),
             symlinks=", ".join(str(item) for item in symlinks[:8]) if symlinks else NA,
         ))
-    return devices
-
-
-def _collect_sys_bus_devices() -> list[dict[str, Any]]:
-    root = "/sys/bus"
-    try:
-        bus_names = sorted(os.listdir(root))
-    except Exception:
-        return []
-
-    devices = []
-    for bus in bus_names:
-        category = SYS_BUS_CATEGORY.get(bus)
-        if not category:
-            continue
-        bus_dir = os.path.join(root, bus, "devices")
-        try:
-            entries = sorted(os.listdir(bus_dir))
-        except Exception:
-            continue
-        for entry in entries:
-            if len(devices) >= MAX_SYS_BUS_DEVICES:
-                return devices
-            sys_path = os.path.join(bus_dir, entry)
-            real_path = os.path.realpath(sys_path)
-            driver = _sys_driver_name(real_path)
-            name = (
-                _sys_attr(real_path, "product", "model", "name", "type", "modalias")
-                or entry
-            )
-            devices.append(_device(
-                name=name,
-                category=category,
-                manufacturer=_sys_attr(real_path, "manufacturer", "vendor"),
-                status=_udev_status(real_path),
-                device_id=real_path,
-                pnp_device_id=f"SYSBUS\\{bus}\\{entry}",
-                description=f"Linux {bus} bus device",
-                service=driver,
-                bus=bus,
-                sysPath=real_path,
-                modalias=_sys_attr(real_path, "modalias"),
-            ))
     return devices
 
 
@@ -982,7 +976,6 @@ def collect_device_manager() -> dict[str, Any]:
         ("power", _collect_power_devices),
         ("input", _collect_input_devices),
         ("udev", _collect_udev_devices),
-        ("sysbus", _collect_sys_bus_devices),
     ):
         rows, error = _collect_source(label, collector)
         devices.extend(rows)
