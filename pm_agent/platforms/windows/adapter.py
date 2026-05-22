@@ -4,7 +4,7 @@ from __future__ import annotations
 from typing import Any
 
 from pm_agent.platforms.base import PlatformAdapter
-from pm_agent.platforms.windows import hardware, metrics, processes, services, terminal, uninstaller, updater
+from pm_agent.platforms.windows import device_manager, hardware, metrics, processes, services, terminal, uninstaller, updater
 from pm_agent.platforms.windows.capabilities import WINDOWS_CAPABILITIES
 
 
@@ -34,6 +34,9 @@ class WindowsAdapter(PlatformAdapter):
 
     def collect_hardware(self) -> dict[str, Any]:
         return hardware.collect_hardware()
+
+    def collect_device_manager(self) -> dict[str, Any]:
+        return device_manager.collect_device_manager()
 
     def start_hardware_sampler(self) -> None:
         hardware.start_hardware_sampler()

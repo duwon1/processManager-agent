@@ -10,6 +10,7 @@ WINDOWS_CAPABILITIES = {
     "terminal": True,
     "fileList": False,
     "hardwareDetail": True,
+    "deviceManager": True,
     "selfUpdate": True,
     "selfUninstall": True,
 }

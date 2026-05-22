@@ -15,6 +15,7 @@ from stomp import stomp_frame, extract_stomp_body, extract_stomp_destination
 
 COMMAND_SUBSCRIPTION_ID = "agent-command-channel"
 SYSINFO_SUBSCRIPTION_ID = "sysinfo-request-channel"
+DEVICE_MANAGER_SUBSCRIPTION_ID = "device-manager-request-channel"
 UPDATE_CHECK_INTERVAL_SECONDS = 60
 MONITORING_SEND_INTERVAL_SECONDS = 1
 PROCESS_SEND_INTERVAL_SECONDS = 1
@@ -187,6 +188,17 @@ async def run_agent(
                     },
                 ))
                 print("[에이전트] 시스템 정보 요청 채널 구독 시작")
+
+                # Windows 장치 관리자형 인벤토리 수집 요청 채널 구독
+                await websocket.send(stomp_frame(
+                    "SUBSCRIBE",
+                    {
+                        "id": DEVICE_MANAGER_SUBSCRIPTION_ID,
+                        "destination": f"/topic/agent.device-manager-request.{agent_id}",
+                        "ack": "auto",
+                    },
+                ))
+                print("[에이전트] 장치 관리자 요청 채널 구독 시작")
 
                 if not agent_secret:
                     # 등록 직후 서버가 발급한 agent-secret을 받을 준비가 끝났음을 알립니다.
@@ -420,6 +432,25 @@ async def run_agent(
                                 print("[에이전트] 시스템 정보 전송 완료")
                             except Exception as e:
                                 print(f"[에이전트] 시스템 정보 수집 오류: {e}")
+                            continue
+
+                        # ── 장치 관리자형 장치/드라이버 인벤토리 요청 ──
+                        if destination == f"/topic/agent.device-manager-request.{agent_id}":
+                            if not _targets_this_agent(payload, destination, agent_id, hostname):
+                                continue
+                            try:
+                                loop = asyncio.get_event_loop()
+                                requested_node_id = payload.get("nodeId")
+                                info = await loop.run_in_executor(None, platform_adapter.collect_device_manager)
+                                info["nodeId"] = requested_node_id
+                                await websocket.send(stomp_frame(
+                                    "SEND",
+                                    {"destination": "/app/device-manager", "content-type": "application/json"},
+                                    json.dumps(info),
+                                ))
+                                print("[에이전트] 장치 관리자 정보 전송 완료")
+                            except Exception as e:
+                                print(f"[에이전트] 장치 관리자 정보 수집 오류: {e}")
                             continue
 
                         if not _targets_this_agent(payload, destination, agent_id, hostname):

@@ -10,6 +10,7 @@ LINUX_CAPABILITIES = {
     "terminal": True,
     "fileList": True,
     "hardwareDetail": True,
+    "deviceManager": False,
     "selfUpdate": True,
     "selfUninstall": True,
 }

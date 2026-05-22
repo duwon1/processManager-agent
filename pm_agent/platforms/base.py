@@ -38,6 +38,26 @@ class PlatformAdapter(ABC):
     def collect_hardware(self) -> dict[str, Any]:
         """OS별 하드웨어 상세 정보를 수집합니다."""
 
+    def collect_device_manager(self) -> dict[str, Any]:
+        """장치 관리자형 장치/드라이버 인벤토리를 수집합니다."""
+        return {
+            "schemaVersion": 1,
+            "osType": self.name,
+            "supported": False,
+            "message": "이 운영체제의 장치 관리자 정보 수집은 아직 지원하지 않습니다.",
+            "summary": {
+                "totalDevices": 0,
+                "problemDevices": 0,
+                "categoryCount": 0,
+            },
+            "devices": [],
+            "categories": [],
+            "cpu": [],
+            "baseboard": {},
+            "gpus": [],
+            "networkAdapters": [],
+        }
+
     @abstractmethod
     def list_files(self, path: str) -> dict[str, Any]:
         """지정 경로의 파일/디렉토리 목록을 반환합니다."""
