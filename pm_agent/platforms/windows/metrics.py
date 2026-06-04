@@ -6,6 +6,7 @@ import json
 import socket
 import subprocess
 import time
+from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 
@@ -74,10 +75,15 @@ _last_memory_perf: dict[str, int] = {}
 _last_memory_perf_time = 0.0
 _last_memory_hardware: dict[str, Any] | None = None
 _last_memory_hardware_time = 0.0
+_last_memory_hardware_attempt_time = 0.0
 _last_disk_inventory: list[dict[str, Any]] = []
 _last_disk_inventory_time = 0.0
+_last_disk_inventory_attempt_time = 0.0
 _last_cpu_perf: dict[str, float] = {}
 _last_cpu_perf_time = 0.0
+_static_refresh_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="pm-static-metrics")
+_memory_hardware_future: Future | None = None
+_disk_inventory_future: Future | None = None
 
 CPU_PERF_CACHE_SECONDS = 1
 GPU_USAGE_CACHE_SECONDS = 1
@@ -86,6 +92,7 @@ POWERSHELL_CACHE_SECONDS = 1
 MEMORY_HARDWARE_CACHE_SECONDS = 60 * 60
 DISK_INVENTORY_CACHE_SECONDS = 60 * 60
 DISK_IO_CACHE_SECONDS = 1
+STATIC_REFRESH_RETRY_SECONDS = 30
 
 
 def _metric(metric_id: int, value: Any) -> dict[str, Any]:
@@ -387,13 +394,7 @@ def _memory_type_name(code: Any) -> str | None:
     return names.get(parsed) if parsed is not None else None
 
 
-def _get_memory_hardware() -> dict[str, Any] | None:
-    global _last_memory_hardware, _last_memory_hardware_time
-
-    now = time.time()
-    if now - _last_memory_hardware_time < MEMORY_HARDWARE_CACHE_SECONDS:
-        return _last_memory_hardware
-
+def _collect_memory_hardware_blocking() -> dict[str, Any] | None:
     rows = _as_list(_run_powershell_json(
         "Get-CimInstance Win32_PhysicalMemory | "
         "Select-Object Capacity,Speed,ConfiguredClockSpeed,SMBIOSMemoryType",
@@ -401,8 +402,6 @@ def _get_memory_hardware() -> dict[str, Any] | None:
     ))
     modules = [row for row in rows if isinstance(row, dict)]
     if not modules:
-        _last_memory_hardware = None
-        _last_memory_hardware_time = now
         return None
 
     capacities = [_to_int(row.get("Capacity")) for row in modules]
@@ -415,29 +414,59 @@ def _get_memory_hardware() -> dict[str, Any] | None:
     memory_types = [_memory_type_name(row.get("SMBIOSMemoryType")) for row in modules]
     memory_types = [memory_type for memory_type in memory_types if memory_type]
 
-    _last_memory_hardware = {
+    return {
         "slotsUsed": len(modules),
         "perSlotBytes": capacities[0] if capacities else None,
         "totalBytes": sum(capacities) if capacities else None,
         "memoryType": memory_types[0] if memory_types else None,
         "speedMtPerSecond": speeds[0] if speeds else None,
     }
-    _last_memory_hardware_time = now
+
+
+def _get_memory_hardware() -> dict[str, Any] | None:
+    global _last_memory_hardware, _last_memory_hardware_time, _last_memory_hardware_attempt_time
+    global _memory_hardware_future
+
+    now = time.time()
+    if _memory_hardware_future is not None and _memory_hardware_future.done():
+        try:
+            _last_memory_hardware = _memory_hardware_future.result()
+        except Exception:
+            _last_memory_hardware = None
+        _last_memory_hardware_time = now
+        _memory_hardware_future = None
+
+    stale = now - _last_memory_hardware_time >= MEMORY_HARDWARE_CACHE_SECONDS
+    retry_ready = now - _last_memory_hardware_attempt_time >= STATIC_REFRESH_RETRY_SECONDS
+    if stale and retry_ready and _memory_hardware_future is None:
+        _last_memory_hardware_attempt_time = now
+        _memory_hardware_future = _static_refresh_executor.submit(_collect_memory_hardware_blocking)
+
     return _last_memory_hardware
 
 
 def _get_disk_inventory() -> list[dict[str, Any]]:
-    global _last_disk_inventory, _last_disk_inventory_time
+    global _last_disk_inventory, _last_disk_inventory_time, _last_disk_inventory_attempt_time
+    global _disk_inventory_future
 
     now = time.time()
-    if now - _last_disk_inventory_time < DISK_INVENTORY_CACHE_SECONDS:
-        return _last_disk_inventory
+    if _disk_inventory_future is not None and _disk_inventory_future.done():
+        try:
+            _last_disk_inventory = _disk_inventory_future.result()
+        except Exception:
+            _last_disk_inventory = []
+        _last_disk_inventory_time = now
+        _disk_inventory_future = None
 
-    if hardware_info is None:
-        _last_disk_inventory = []
-    else:
-        _last_disk_inventory = hardware_info._collect_disk_inventory()
-    _last_disk_inventory_time = now
+    stale = now - _last_disk_inventory_time >= DISK_INVENTORY_CACHE_SECONDS
+    retry_ready = now - _last_disk_inventory_attempt_time >= STATIC_REFRESH_RETRY_SECONDS
+    if stale and retry_ready and _disk_inventory_future is None:
+        _last_disk_inventory_attempt_time = now
+        if hardware_info is None:
+            _last_disk_inventory = []
+            _last_disk_inventory_time = now
+        else:
+            _disk_inventory_future = _static_refresh_executor.submit(hardware_info._collect_disk_inventory)
     return _last_disk_inventory
 
 
@@ -494,30 +523,14 @@ def _get_disk_devices(
     active_times = active_times or {}
     disk_details = disk_details or {}
     if hardware_info is None:
-        try:
-            usage = psutil.disk_usage(_get_system_disk_path())
-            read_bps, write_bps = next(iter(io_speeds.values()), (None, None))
-            active_percent = next(iter(active_times.values()), None)
-            return [{
-                "mountpoint": _get_system_disk_path(),
-                "partitions": _get_system_disk_path(),
-                "device": _get_system_disk_path(),
-                "totalBytes": usage.total,
-                "usedBytes": usage.used,
-                "freeBytes": usage.free,
-                "usagePercent": active_percent,
-                "activeTimePercent": active_percent,
-                "capacityUsagePercent": round(usage.percent, 1),
-                "readBytesPerSecond": read_bps,
-                "writeBytesPerSecond": write_bps,
-                "averageResponseTimeMs": next((details.get("averageResponseTimeMs") for details in disk_details.values() if details), None),
-                "queueLength": next((details.get("queueLength") for details in disk_details.values() if details), None),
-            }]
-        except Exception:
-            return []
+        return _get_fallback_disk_devices(io_speeds, active_times, disk_details)
 
     grouped: dict[str, list[dict[str, Any]]] = {}
-    for row in _get_disk_inventory():
+    inventory = _get_disk_inventory()
+    if not inventory:
+        return _get_fallback_disk_devices(io_speeds, active_times, disk_details)
+
+    for row in inventory:
         grouped.setdefault(hardware_info._physical_disk_key(row), []).append(row)
 
     disks: list[dict[str, Any]] = []
@@ -568,6 +581,71 @@ def _get_disk_devices(
         })
 
     return disks
+
+
+def _get_fallback_disk_devices(
+    io_speeds: dict[str, tuple[int, int]],
+    active_times: dict[str, float],
+    disk_details: dict[str, dict[str, Any]],
+) -> list[dict[str, Any]]:
+    disks: list[dict[str, Any]] = []
+    partitions = psutil.disk_partitions(all=False)
+    if not partitions:
+        partitions = []
+
+    for partition in partitions:
+        try:
+            usage = psutil.disk_usage(partition.mountpoint)
+        except Exception:
+            continue
+
+        device = str(partition.device or partition.mountpoint)
+        key = device.rstrip("\\").lower()
+        read_bps, write_bps = io_speeds.get(key, next(iter(io_speeds.values()), (None, None)))
+        active_percent = active_times.get(key, next(iter(active_times.values()), None))
+        detail = disk_details.get(key, next((value for value in disk_details.values() if value), {}))
+        disks.append({
+            "mountpoint": partition.mountpoint,
+            "partitions": partition.mountpoint,
+            "device": device,
+            "totalBytes": usage.total,
+            "usedBytes": usage.used,
+            "freeBytes": usage.free,
+            "usagePercent": active_percent,
+            "activeTimePercent": active_percent,
+            "capacityUsagePercent": round(usage.percent, 1),
+            "readBytesPerSecond": read_bps,
+            "writeBytesPerSecond": write_bps,
+            "averageResponseTimeMs": detail.get("averageResponseTimeMs"),
+            "queueLength": detail.get("queueLength"),
+        })
+
+    if disks:
+        return disks
+
+    try:
+        usage = psutil.disk_usage(_get_system_disk_path())
+    except Exception:
+        return []
+
+    read_bps, write_bps = next(iter(io_speeds.values()), (None, None))
+    active_percent = next(iter(active_times.values()), None)
+    detail = next((value for value in disk_details.values() if value), {})
+    return [{
+        "mountpoint": _get_system_disk_path(),
+        "partitions": _get_system_disk_path(),
+        "device": _get_system_disk_path(),
+        "totalBytes": usage.total,
+        "usedBytes": usage.used,
+        "freeBytes": usage.free,
+        "usagePercent": active_percent,
+        "activeTimePercent": active_percent,
+        "capacityUsagePercent": round(usage.percent, 1),
+        "readBytesPerSecond": read_bps,
+        "writeBytesPerSecond": write_bps,
+        "averageResponseTimeMs": detail.get("averageResponseTimeMs"),
+        "queueLength": detail.get("queueLength"),
+    }]
 
 
 def _disk_active_percent(disks: list[dict[str, Any]]) -> float | None:

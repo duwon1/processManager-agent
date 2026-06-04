@@ -223,7 +223,7 @@ async def run_agent(
                 async def report_update_result(stage: str, success: bool | None = None, message: str = ""):
                     """업데이트 명령 ACK와 재연결 후 최신 커밋 확인 결과를 서버에 보고합니다."""
                     agent_dir = os.path.dirname(os.path.abspath(__file__))
-                    current_sha, latest_sha, error = get_git_revisions(agent_dir)
+                    current_sha, latest_sha, error = await asyncio.to_thread(get_git_revisions, agent_dir)
                     resolved_success = (not error and current_sha == latest_sha) if success is None else success
                     await websocket.send(stomp_frame(
                         "SEND",
@@ -263,7 +263,7 @@ async def run_agent(
                             else:
                                 print(f"[agent] runtime security hardening failed: {security_message}")
 
-                        current_sha, latest_sha, error = get_git_revisions(agent_dir)
+                        current_sha, latest_sha, error = await asyncio.to_thread(get_git_revisions, agent_dir)
                         if error:
                             print(f"[에이전트] 업데이트 확인 오류: {error}")
                             await report_update_result("check-failed", False, error[-400:])
