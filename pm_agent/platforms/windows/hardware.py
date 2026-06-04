@@ -412,7 +412,7 @@ def _collect_disk_inventory() -> list[dict[str, Any]]:
     script = r"""
 $physical = Get-PhysicalDisk -ErrorAction SilentlyContinue |
   Select-Object FriendlyName,MediaType,BusType,Size
-Get-CimInstance Win32_LogicalDisk -Filter 'DriveType=3' | ForEach-Object {
+Get-CimInstance Win32_LogicalDisk -Filter 'DriveType=2 OR DriveType=3' | ForEach-Object {
   $logical = $_
   $partition = Get-CimAssociatedInstance -InputObject $logical -Association Win32_LogicalDiskToPartition |
     Select-Object -First 1
@@ -433,6 +433,7 @@ Get-CimInstance Win32_LogicalDisk -Filter 'DriveType=3' | ForEach-Object {
     Size = [int64]$logical.Size
     FreeSpace = [int64]$logical.FreeSpace
     VolumeName = $logical.VolumeName
+    DriveType = $logical.DriveType
     DiskModel = $disk.Model
     DiskIndex = $disk.Index
     DiskDeviceId = $disk.DeviceID
