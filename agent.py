@@ -326,22 +326,25 @@ async def run_agent(
                         elapsed = asyncio.get_running_loop().time() - started_at
                         await asyncio.sleep(max(0, PROCESS_SEND_INTERVAL_SECONDS - elapsed))
 
+                async def send_service_snapshot(name: str = "service collection"):
+                    svc_list = await _run_blocking(
+                        name,
+                        platform_adapter.list_services,
+                        SERVICE_COLLECT_TIMEOUT_SECONDS,
+                    )
+                    await websocket.send(stomp_frame(
+                        "SEND",
+                        {"destination": "/app/service", "content-type": "application/json"},
+                        json.dumps(svc_list),
+                    ))
+
                 async def send_service_loop():
                     """서비스 목록을 10초 간격으로 전송합니다."""
                     failures = 0
                     while True:
                         started_at = asyncio.get_running_loop().time()
                         try:
-                            svc_list = await _run_blocking(
-                                "service collection",
-                                platform_adapter.list_services,
-                                SERVICE_COLLECT_TIMEOUT_SECONDS,
-                            )
-                            await websocket.send(stomp_frame(
-                                "SEND",
-                                {"destination": "/app/service", "content-type": "application/json"},
-                                json.dumps(svc_list),
-                            ))
+                            await send_service_snapshot()
                             failures = 0
                         except Exception as e:
                             failures += 1
@@ -538,6 +541,11 @@ async def run_agent(
                                     "agentId": agent_id,
                                 }),
                             ))
+                            if success:
+                                try:
+                                    await send_service_snapshot("service refresh")
+                                except Exception as refresh_error:
+                                    print(f"[에이전트] 서비스 제어 후 즉시 갱신 오류: {refresh_error}")
                             continue
 
                         # ── 파일 목록 요청 처리 ──
