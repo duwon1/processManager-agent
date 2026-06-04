@@ -1,5 +1,7 @@
 import os
+import shutil
 import signal
+import subprocess
 import time
 from datetime import datetime
 from typing import Dict, List
@@ -14,6 +16,13 @@ PROCESS_LIMIT = None
 CPU_SAMPLE_INTERVAL = 0.1
 MAX_CMDLINE_LENGTH = 160
 MAX_EXE_LENGTH = 120
+SUDO_DENIED_TERMS = (
+    "a password is required",
+    "a terminal is required",
+    "not allowed to execute",
+    "may not run sudo",
+    "password is required",
+)
 
 # 이전 I/O 측정값 캐시: pid -> (prev_read_bytes, prev_write_bytes, timestamp)
 _io_cache: dict[int, tuple[float, float, float]] = {}
@@ -159,7 +168,28 @@ def kill_process_by_pid(pid: int) -> str:
     except ProcessLookupError as exc:
         raise HTTPException(status_code=404, detail=f"프로세스 {pid}를 찾을 수 없습니다.") from exc
     except PermissionError as exc:
-        raise HTTPException(status_code=403, detail=f"프로세스 {pid} 종료 권한이 없습니다.") from exc
+        kill_bin = shutil.which("kill") or "/usr/bin/kill"
+        try:
+            result = subprocess.run(
+                ["sudo", "-n", kill_bin, "-9", str(pid)],
+                check=True,
+                timeout=10,
+                capture_output=True,
+                text=True,
+            )
+        except subprocess.CalledProcessError as sudo_exc:
+            detail = (sudo_exc.stderr or sudo_exc.stdout or f"프로세스 {pid} 종료 권한이 없습니다.").strip()
+            if _is_sudo_denied(detail):
+                detail = "프로세스 종료 sudoers 권한이 없습니다. 리눅스 에이전트 설치 명령어를 다시 실행해 권한을 갱신하세요."
+            raise HTTPException(status_code=403, detail=detail) from sudo_exc
+        except subprocess.TimeoutExpired as sudo_exc:
+            raise HTTPException(status_code=504, detail=f"프로세스 {pid} 종료 요청이 시간 초과됐습니다.") from sudo_exc
+        return (result.stdout or f"PID {pid} 종료했습니다.").strip()
+
+
+def _is_sudo_denied(detail: str) -> bool:
+    lower_detail = (detail or "").lower()
+    return any(term in lower_detail for term in SUDO_DENIED_TERMS)
 
 
 @router.get("/all", response_model=List[Dict])

@@ -206,7 +206,15 @@ $settings = New-ScheduledTaskSettingsSet `
     -StartWhenAvailable `
     -RestartCount 3 `
     -RestartInterval (New-TimeSpan -Minutes 1)
-Set-ScheduledTask -TaskName $taskName -Action $action -Trigger @($logonTrigger, $watchdogTrigger) -Settings $settings | Out-Null
+$userId = $task.Principal.UserId
+if ([string]::IsNullOrWhiteSpace($userId)) {{
+    $userId = [Security.Principal.WindowsIdentity]::GetCurrent().Name
+}}
+$principal = New-ScheduledTaskPrincipal `
+    -UserId $userId `
+    -LogonType Interactive `
+    -RunLevel Highest
+Set-ScheduledTask -TaskName $taskName -Action $action -Trigger @($logonTrigger, $watchdogTrigger) -Settings $settings -Principal $principal | Out-Null
 Write-Output "task registration updated"
 """
     result = _run_hidden_powershell(script, timeout=20)

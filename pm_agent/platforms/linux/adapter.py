@@ -63,7 +63,7 @@ class LinuxAdapter(PlatformAdapter):
         return await updater.self_update(agent_dir)
 
     async def ensure_runtime_security(self, agent_dir: str, service_name: str) -> tuple[bool, str]:
-        return await security.ensure_limited_sudoers(agent_dir, service_name)
+        return await security.ensure_agent_sudoers(agent_dir, service_name)
 
     def start_self_uninstall(self, agent_dir: str, service_name: str) -> None:
         uninstaller.start_self_uninstall(agent_dir, service_name)

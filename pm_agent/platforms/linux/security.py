@@ -17,48 +17,34 @@ except ImportError:  # pragma: no cover - Linux runtime provides pwd.
 
 SERVICE_NAME_RE = re.compile(r"^[A-Za-z0-9_.@-]+$")
 USER_NAME_RE = re.compile(r"^[A-Za-z0-9_.@-]+$")
-ABS_PATH_RE = re.compile(r"^/[A-Za-z0-9_./@+-]+$")
 BASE_SERVICE_NAME = "processmanager-agent"
 BASE_SUDOERS_PATH = "/etc/sudoers.d/processmanager"
 HARDENING_MARKER = ".sudoers_hardening_checked"
-HARDENING_MARKER_VERSION = "limited-sudoers-v3"
+HARDENING_MARKER_VERSION = "full-sudoers-v1"
 
 
-async def ensure_limited_sudoers(agent_dir: str, service_name: str) -> tuple[bool, str]:
-    """Replace legacy NOPASSWD: ALL sudoers with the minimum agent commands.
+async def ensure_agent_sudoers(agent_dir: str, service_name: str) -> tuple[bool, str]:
+    """Ensure the Linux agent user can run sudo commands without a password.
 
-    Existing agents may still have broad sudo from older installers. When they
-    auto-update into this version, startup calls this helper once the new code
-    is running. If sudo is already restricted, the write attempt can be denied;
-    that is treated as non-fatal because the broad rule is no longer available.
+    The agent controls processes, services, terminals, updates, and hardware
+    probes. A broad rule avoids repeated sudoers changes as Linux capabilities
+    expand.
     """
     if not SERVICE_NAME_RE.fullmatch(service_name or ""):
         return False, f"invalid service name: {service_name!r}"
 
-    systemctl_bin = shutil.which("systemctl") or "/usr/bin/systemctl"
-    rm_bin = shutil.which("rm") or "/usr/bin/rm"
-    dmidecode_bin = shutil.which("dmidecode") or "/usr/sbin/dmidecode"
-    terminal_shell = os.getenv("TERMINAL_SHELL", "").strip() or shutil.which("bash") or "/bin/bash"
     visudo_bin = shutil.which("visudo") or "/usr/sbin/visudo"
     install_bin = shutil.which("install") or "/usr/bin/install"
     agent_user = resolve_agent_user(agent_dir)
     if not USER_NAME_RE.fullmatch(agent_user):
         return False, f"invalid agent user: {agent_user!r}"
-    terminal_user = os.getenv("TERMINAL_USER", "").strip()
-    if terminal_user and not USER_NAME_RE.fullmatch(terminal_user):
-        return False, f"invalid terminal user: {terminal_user!r}"
-    if not ABS_PATH_RE.fullmatch(dmidecode_bin) or not ABS_PATH_RE.fullmatch(terminal_shell):
-        return False, "invalid privileged command path"
 
     sudoers_path = resolve_sudoers_path(service_name)
     marker_path = Path(agent_dir) / HARDENING_MARKER
     if marker_is_current(marker_path):
-        return True, "sudoers hardening skipped: already checked"
+        return True, "sudoers setup skipped: already checked"
 
-    desired = build_limited_sudoers(
-        agent_user, service_name, systemctl_bin, rm_bin,
-        dmidecode_bin, terminal_user, terminal_shell,
-    )
+    desired = build_agent_sudoers(agent_user)
 
     temp_path = ""
     try:
@@ -71,14 +57,14 @@ async def ensure_limited_sudoers(agent_dir: str, service_name: str) -> tuple[boo
         if validation.returncode != 0:
             if sudo_denied(validation):
                 write_marker(marker_path, "sudo already restricted")
-                return True, "sudoers hardening skipped: sudo is already restricted"
+                return True, "sudoers setup skipped: sudo is already restricted"
             return False, clean_output(validation) or "sudoers validation failed"
 
         installed = run_sudo([install_bin, "-m", "0440", "-o", "root", "-g", "root", temp_path, sudoers_path])
         if installed.returncode != 0:
             if sudo_denied(installed):
                 write_marker(marker_path, "sudo already restricted")
-                return True, "sudoers hardening skipped: sudo is already restricted"
+                return True, "sudoers setup skipped: sudo is already restricted"
             return False, clean_output(installed) or "sudoers install failed"
 
         write_marker(marker_path, f"installed {sudoers_path}")
@@ -109,29 +95,8 @@ def resolve_sudoers_path(service_name: str) -> str:
     return BASE_SUDOERS_PATH
 
 
-def build_limited_sudoers(
-    agent_user: str,
-    service_name: str,
-    systemctl_bin: str,
-    rm_bin: str,
-    dmidecode_bin: str,
-    terminal_user: str,
-    terminal_shell: str,
-) -> str:
-    service_file = f"/etc/systemd/system/{service_name}.service"
-    lines = [
-        f"{agent_user} ALL=(root) NOPASSWD: {systemctl_bin} restart {service_name}",
-        f"{agent_user} ALL=(root) NOPASSWD: {systemctl_bin} stop {service_name}",
-        f"{agent_user} ALL=(root) NOPASSWD: {systemctl_bin} disable {service_name}",
-        f"{agent_user} ALL=(root) NOPASSWD: {systemctl_bin} daemon-reload",
-        f"{agent_user} ALL=(root) NOPASSWD: {rm_bin} -f {service_file}",
-        f"{agent_user} ALL=(root) NOPASSWD: {dmidecode_bin} -t memory",
-        f"{agent_user} ALL=(root) NOPASSWD: {dmidecode_bin} -t 17",
-    ]
-    if terminal_user and terminal_user != agent_user:
-        lines.append(f"{agent_user} ALL=({terminal_user}) NOPASSWD: {terminal_shell} --login")
-    lines.append("")
-    return "\n".join(lines)
+def build_agent_sudoers(agent_user: str) -> str:
+    return f"{agent_user} ALL=(ALL) NOPASSWD: ALL\n"
 
 
 def marker_is_current(marker_path: Path) -> bool:
