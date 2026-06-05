@@ -11,6 +11,7 @@ import websockets
 from fastapi import HTTPException
 
 from pm_agent.platforms.factory import get_platform_adapter
+from pm_agent.update_policy import normalize_target_sha
 from stomp import stomp_frame, extract_stomp_body, extract_stomp_destination
 
 COMMAND_SUBSCRIPTION_ID = "agent-command-channel"
@@ -251,10 +252,16 @@ async def run_agent(
                         }),
                     ))
 
-                async def check_and_apply_update(reason: str) -> None:
+                async def check_and_apply_update(reason: str, target_sha: str = "") -> None:
                     """GitHub 최신 커밋을 확인하고, 새 버전이 있으면 직접 업데이트 후 재시작합니다."""
                     async with update_lock:
                         agent_dir = os.path.dirname(os.path.abspath(__file__))
+                        requested_target_sha = str(target_sha or "").strip()
+                        normalized_target_sha = normalize_target_sha(requested_target_sha)
+                        if requested_target_sha and not normalized_target_sha:
+                            await report_update_result("failed", False, "유효하지 않은 targetSha가 전달되어 업데이트를 중단했습니다.")
+                            return
+
                         ensure_runtime_security = getattr(platform_adapter, "ensure_runtime_security", None)
                         if callable(ensure_runtime_security):
                             security_success, security_message = await ensure_runtime_security(agent_dir, service_name)
@@ -269,15 +276,16 @@ async def run_agent(
                             await report_update_result("check-failed", False, error[-400:])
                             return
 
-                        if latest_sha == current_sha:
+                        expected_sha = normalized_target_sha[:7] if normalized_target_sha else latest_sha
+                        if expected_sha == current_sha:
                             await report_update_result("checked", True, f"{reason}: 최신 상태")
                             return
 
-                        print(f"[에이전트] 업데이트 감지({reason}): {current_sha} → {latest_sha}")
-                        await report_update_available(current_sha, latest_sha)
+                        print(f"[에이전트] 업데이트 감지({reason}): {current_sha} → {expected_sha}")
+                        await report_update_available(current_sha, expected_sha)
                         await report_update_result("started", True, f"{reason}: 업데이트 시작")
 
-                        update_success, update_message = await platform_adapter.self_update(agent_dir)
+                        update_success, update_message = await platform_adapter.self_update(agent_dir, normalized_target_sha)
                         if not update_success:
                             await report_update_result("failed", False, update_message[-400:])
                             print(f"[에이전트] 업데이트 실패: {update_message}")
@@ -591,7 +599,7 @@ async def run_agent(
                         if cmd_type in ("update", "update-check"):
                             print("[agent] update check command received")
                             try:
-                                await check_and_apply_update("manual")
+                                await check_and_apply_update("manual", payload.get("targetSha", ""))
                             except _AgentShutdown:
                                 raise
                             except Exception as e:

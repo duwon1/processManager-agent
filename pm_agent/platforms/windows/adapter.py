@@ -71,8 +71,8 @@ class WindowsAdapter(PlatformAdapter):
     def cleanup_terminals(self) -> None:
         terminal.cleanup_all()
 
-    async def self_update(self, agent_dir: str) -> tuple[bool, str]:
-        return await updater.self_update(agent_dir)
+    async def self_update(self, agent_dir: str, target_sha: str = "") -> tuple[bool, str]:
+        return await updater.self_update(agent_dir, target_sha)
 
     async def ensure_runtime_security(self, agent_dir: str, service_name: str) -> tuple[bool, str]:
         return await asyncio.to_thread(updater.ensure_runtime_layout, agent_dir, service_name)

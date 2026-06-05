@@ -11,6 +11,8 @@ import textwrap
 import uuid
 from pathlib import Path
 
+from pm_agent.update_policy import normalize_target_sha
+
 
 def ensure_runtime_layout(agent_dir: str, task_name: str) -> tuple[bool, str]:
     target_dir = Path(agent_dir).resolve()
@@ -30,30 +32,65 @@ def ensure_runtime_layout(agent_dir: str, task_name: str) -> tuple[bool, str]:
     return True, "Windows runtime layout checked"
 
 
-async def self_update(agent_dir: str) -> tuple[bool, str]:
+async def self_update(agent_dir: str, target_sha: str = "") -> tuple[bool, str]:
     """Pull the latest agent source, refresh dependencies, and restart the scheduled task."""
     target_dir = Path(agent_dir).resolve()
     if not _looks_like_agent_dir(target_dir):
         return False, f"unexpected agent directory: {target_dir}"
+    requested_target_sha = str(target_sha or "").strip()
+    normalized_target_sha = normalize_target_sha(requested_target_sha)
+    if requested_target_sha and not normalized_target_sha:
+        return False, "invalid targetSha"
 
     git_path = shutil.which("git")
     if not git_path:
         return False, "Git을 찾을 수 없어 Windows 에이전트를 업데이트할 수 없습니다."
 
-    pull_result = await asyncio.to_thread(
+    fetch_result = await asyncio.to_thread(
         subprocess.run,
-        [git_path, "-C", str(target_dir), "pull", "origin", "master"],
+        [git_path, "-C", str(target_dir), "fetch", "origin", "master"],
         text=True,
         capture_output=True,
         timeout=120,
         check=False,
         **_hidden_subprocess_kwargs(),
     )
-    if pull_result.returncode != 0:
-        return False, _command_output(pull_result) or "git pull failed"
+    if fetch_result.returncode != 0:
+        return False, _command_output(fetch_result) or "git fetch failed"
+
+    if normalized_target_sha:
+        update_command = [git_path, "-C", str(target_dir), "checkout", "--detach", normalized_target_sha]
+        update_label = "git checkout failed"
+    else:
+        checkout_result = await asyncio.to_thread(
+            subprocess.run,
+            [git_path, "-C", str(target_dir), "checkout", "master"],
+            text=True,
+            capture_output=True,
+            timeout=120,
+            check=False,
+            **_hidden_subprocess_kwargs(),
+        )
+        if checkout_result.returncode != 0:
+            return False, _command_output(checkout_result) or "git checkout master failed"
+        update_command = [git_path, "-C", str(target_dir), "pull", "--ff-only", "origin", "master"]
+        update_label = "git pull failed"
+
+    update_result = await asyncio.to_thread(
+        subprocess.run,
+        update_command,
+        text=True,
+        capture_output=True,
+        timeout=120,
+        check=False,
+        **_hidden_subprocess_kwargs(),
+    )
+    if update_result.returncode != 0:
+        return False, _command_output(update_result) or update_label
 
     python_path = target_dir / ".venv" / "Scripts" / "python.exe"
-    requirements_path = target_dir / "requirements.txt"
+    requirements_lock_path = target_dir / "requirements.lock"
+    requirements_path = requirements_lock_path if requirements_lock_path.exists() else target_dir / "requirements.txt"
     if not python_path.exists():
         return False, f"Python venv not found: {python_path}"
 
@@ -70,6 +107,7 @@ async def self_update(agent_dir: str) -> tuple[bool, str]:
             "install",
             "--no-cache-dir",
             "--disable-pip-version-check",
+            *(["--require-hashes"] if requirements_lock_path.exists() else []),
             "-r",
             str(requirements_path),
             "-q",
@@ -92,7 +130,7 @@ async def self_update(agent_dir: str) -> tuple[bool, str]:
     restart_script = _write_restart_script()
     _start_detached_restart(restart_script, task_name)
 
-    message = _command_output(pull_result) or "업데이트 적용 완료"
+    message = _command_output(update_result) or "업데이트 적용 완료"
     return True, message
 
 

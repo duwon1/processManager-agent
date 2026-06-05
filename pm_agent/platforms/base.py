@@ -87,7 +87,7 @@ class PlatformAdapter(ABC):
         """열려 있는 터미널 세션을 모두 정리합니다."""
 
     @abstractmethod
-    async def self_update(self, agent_dir: str) -> tuple[bool, str]:
+    async def self_update(self, agent_dir: str, target_sha: str = "") -> tuple[bool, str]:
         """에이전트 코드를 최신화하고 성공 여부와 메시지를 반환합니다."""
 
     @abstractmethod
