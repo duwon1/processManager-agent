@@ -59,12 +59,12 @@ async def self_update(agent_dir: str, target_sha: str = "") -> tuple[bool, str]:
         return False, _command_output(fetch_result) or "git fetch failed"
 
     if normalized_target_sha:
-        update_command = [git_path, "-C", str(target_dir), "checkout", "--detach", normalized_target_sha]
+        update_command = [git_path, "-C", str(target_dir), "checkout", "--force", "--detach", normalized_target_sha]
         update_label = "git checkout failed"
     else:
         checkout_result = await asyncio.to_thread(
             subprocess.run,
-            [git_path, "-C", str(target_dir), "checkout", "master"],
+            [git_path, "-C", str(target_dir), "checkout", "--force", "master"],
             text=True,
             capture_output=True,
             timeout=120,
