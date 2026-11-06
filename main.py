@@ -1,7 +1,10 @@
 """Process Manager Agent 진입점입니다.
-FastAPI 앱을 초기화하고 에이전트 태스크를 생명주기에 맞춰 관리합니다.
+기본 실행은 WebSocket 에이전트 루프만 기동합니다.
+AGENT_DEBUG_HTTP=1일 때만 127.0.0.1에 읽기 전용 디버그 HTTP API(FastAPI)를 함께 띄웁니다.
 """
 import asyncio
+import os
+import signal
 from contextlib import asynccontextmanager
 
 import uvicorn
@@ -14,6 +17,13 @@ from pm_agent.platforms.factory import get_platform_adapter
 
 settings = get_settings()
 _platform_adapter: PlatformAdapter | None = None
+# 디버그 HTTP API는 외부에 노출하지 않도록 loopback에만 바인딩합니다.
+DEBUG_HTTP_HOST = "127.0.0.1"
+
+
+def debug_http_enabled() -> bool:
+    """AGENT_DEBUG_HTTP가 명시적으로 켜져 있을 때만 디버그 HTTP API를 기동합니다."""
+    return os.getenv("AGENT_DEBUG_HTTP", "").strip().lower() in ("1", "true", "yes")
 
 
 def get_adapter() -> PlatformAdapter:
@@ -24,15 +34,14 @@ def get_adapter() -> PlatformAdapter:
     return _platform_adapter
 
 
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    """앱 생명주기에 맞춰 에이전트 태스크를 시작하고 종료합니다."""
+def start_agent_task() -> asyncio.Task:
+    """기동 정보를 출력하고 WebSocket 에이전트 태스크를 시작합니다."""
     print("에이전트 기동이 완료되었습니다.")
     print(f"WebSocket 대상 서버: {settings.websocket_url}")
     print(f"에이전트 호스트명: {settings.hostname}")
     print(f"에이전트 ID: {settings.agent_id}")
 
-    agent_task = asyncio.create_task(
+    return asyncio.create_task(
         run_agent(
             settings.websocket_url,
             settings.account_token,
@@ -43,8 +52,10 @@ async def lifespan(app: FastAPI):
             settings.agent_secret,
         )
     )
-    yield
 
+
+async def stop_agent_task(agent_task: asyncio.Task) -> None:
+    """터미널 세션을 정리하고 에이전트 태스크를 종료합니다."""
     print("에이전트 종료를 시작합니다.")
     get_adapter().cleanup_terminals()
     agent_task.cancel()
@@ -52,6 +63,32 @@ async def lifespan(app: FastAPI):
         await agent_task
     except asyncio.CancelledError:
         pass
+
+
+async def run_without_http() -> None:
+    """HTTP 서버 없이 에이전트 루프만 실행합니다. SIGTERM/SIGINT 시 정리 후 종료합니다."""
+    agent_task = start_agent_task()
+    loop = asyncio.get_running_loop()
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        try:
+            loop.add_signal_handler(sig, agent_task.cancel)
+        except (NotImplementedError, RuntimeError, ValueError):
+            # Windows 이벤트 루프는 signal handler를 지원하지 않아 KeyboardInterrupt로 종료합니다.
+            pass
+    try:
+        await agent_task
+    except asyncio.CancelledError:
+        pass
+    finally:
+        await stop_agent_task(agent_task)
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """앱 생명주기에 맞춰 에이전트 태스크를 시작하고 종료합니다."""
+    agent_task = start_agent_task()
+    yield
+    await stop_agent_task(agent_task)
 
 
 app = FastAPI(lifespan=lifespan)
@@ -69,11 +106,12 @@ def get_all_processes_http():
     return get_adapter().list_processes()
 
 
-@app.delete("/process/{pid}")
-def kill_process_http(pid: int):
-    """현재 OS adapter를 통해 프로세스를 종료합니다. 디버깅용으로 사용합니다."""
-    return {"message": get_adapter().kill_process(pid)}
-
-
 if __name__ == "__main__":
-    uvicorn.run("main:app", host="0.0.0.0", port=settings.port, reload=settings.reload)
+    if debug_http_enabled():
+        print(f"디버그 HTTP API 활성화: http://{DEBUG_HTTP_HOST}:{settings.port}")
+        uvicorn.run("main:app", host=DEBUG_HTTP_HOST, port=settings.port, reload=settings.reload)
+    else:
+        try:
+            asyncio.run(run_without_http())
+        except KeyboardInterrupt:
+            pass

@@ -275,6 +275,21 @@ def _status_from_threads(entry_address: int, thread_count: int, cpu_percent: flo
     return "unknown"
 
 
+def get_started_at(pid: int) -> str | None:
+    """list_processes와 같은 CreateTime/_format_started_at으로 PID의 started_at을 반환합니다."""
+    buffer = _query_process_buffer()
+    base_address = ctypes.addressof(buffer)
+    offset = 0
+    while True:
+        entry = SYSTEM_PROCESS_INFORMATION.from_address(base_address + offset)
+        if int(entry.UniqueProcessId or 0) == pid:
+            return _format_started_at(int(entry.CreateTime or 0))
+        if entry.NextEntryOffset == 0:
+            break
+        offset += int(entry.NextEntryOffset)
+    raise LookupError(f"프로세스 {pid}를 찾을 수 없습니다.")
+
+
 def list_processes() -> list[dict[str, Any]]:
     buffer = _query_process_buffer()
     base_address = ctypes.addressof(buffer)

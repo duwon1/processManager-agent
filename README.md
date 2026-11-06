@@ -48,7 +48,6 @@ Managed PC or Server
 | 프로세스 조회/종료 | 지원 | 지원 |
 | 서비스 조회/제어 | 지원 | 지원 |
 | 터미널 | PowerShell/CMD | Shell/PTY |
-| 파일 목록 조회 | 미지원 | 지원 |
 | 하드웨어 상세 | 지원 | 지원 |
 | 장치 인벤토리 | 지원 | 지원 |
 | 자동 업데이트 | 지원 | 지원 |
@@ -58,7 +57,7 @@ Managed PC or Server
 
 ```text
 processManager-agent
-├─ main.py                  # FastAPI 진입점, 에이전트 생명주기 관리
+├─ main.py                  # 진입점, 에이전트 생명주기 관리 (디버그 HTTP API는 옵션)
 ├─ agent.py                 # STOMP WebSocket 연결, 데이터 전송, 명령 처리
 ├─ config.py                # .env 로딩과 실행 설정
 ├─ stomp.py                 # STOMP 프레임 생성/파싱
@@ -67,7 +66,7 @@ processManager-agent
 │  ├─ base.py               # 공통 인터페이스
 │  ├─ factory.py            # OS별 adapter 선택
 │  ├─ windows/              # Windows 메트릭, 서비스, 터미널, 업데이트
-│  └─ linux/                # Linux 메트릭, 서비스, 파일, 터미널, 업데이트
+│  └─ linux/                # Linux 메트릭, 서비스, 터미널, 업데이트
 ├─ requirements.txt         # 기본 Python 의존성
 └─ requirements.lock        # 해시 잠금 의존성
 ```
@@ -89,7 +88,7 @@ processManager-agent
 ```bash
 python -m venv .venv
 source .venv/bin/activate
-pip install -r requirements.txt
+pip install --require-hashes -r requirements.lock
 python main.py
 ```
 
@@ -98,9 +97,12 @@ Windows PowerShell에서는 다음처럼 가상환경을 활성화할 수 있습
 ```powershell
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
-pip install -r requirements.txt
+pip install --require-hashes -r requirements.lock
 python main.py
 ```
+
+`requirements.lock`은 모든 패키지의 버전과 해시를 고정합니다.
+해시가 다르거나 잠금 파일에 없는 패키지가 섞이면 설치가 실패하므로, `requirements.txt`는 잠금 파일을 다시 생성할 때만 사용합니다.
 
 설치 중 노드 이름 입력 프롬프트가 표시되면 원하는 이름을 입력합니다.
 엔터를 누르면 시스템 호스트명이 자동으로 사용됩니다.
@@ -115,7 +117,8 @@ python main.py
 | `AGENT_ID` | X | 서버가 발급한 노드 고유 ID | - |
 | `HOSTNAME` | X | 웹에 표시할 노드 이름 | 시스템 호스트명 |
 | `OS_TYPE` | X | 강제로 지정할 OS 타입 (`Windows`, `Linux`) | 실행 OS |
-| `AGENT_PORT` | X | FastAPI HTTP API 포트 | `8888` |
+| `AGENT_DEBUG_HTTP` | X | `1`일 때만 디버그 HTTP API를 `127.0.0.1`에 기동 | 비활성 |
+| `AGENT_PORT` | X | 디버그 HTTP API 포트 (`AGENT_DEBUG_HTTP=1`일 때만 사용) | `8888` |
 | `LINUX_API_RELOAD` | X | FastAPI 개발 모드 리로드 | `false` |
 | `INSTANCE` | X | 설치 인스턴스 구분값 | `default` |
 | `SERVICE_NAME` | X | 업데이트/삭제 시 제어할 서비스 또는 작업 이름 | `processmanager-agent` |
@@ -127,15 +130,15 @@ python main.py
 
 ## 로컬 확인용 HTTP API
 
-FastAPI 서버는 디버깅용 HTTP API를 제공합니다.
+기본 실행에서는 HTTP 서버를 띄우지 않습니다.
+`AGENT_DEBUG_HTTP=1`을 설정한 경우에만 `127.0.0.1:{AGENT_PORT}`에 읽기 전용 디버그 API를 기동합니다.
 
 | Method | Path | 설명 |
 |--------|------|------|
 | `GET` | `/monitoring` | 현재 시스템 메트릭 즉시 조회 |
 | `GET` | `/process/all` | 현재 프로세스 목록 조회 |
-| `DELETE` | `/process/{pid}` | 지정 PID 프로세스 종료 |
 
-운영 기능은 백엔드와의 STOMP WebSocket 연결을 통해 동작하며, 위 HTTP API는 로컬 확인용입니다.
+프로세스 종료 같은 제어 기능은 HTTP로 제공하지 않으며, 백엔드와의 STOMP WebSocket 연결을 통해서만 동작합니다.
 
 ## 업데이트 방식
 

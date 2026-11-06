@@ -1,7 +1,8 @@
 """systemd 서비스 목록 수집 및 제어."""
 import re
-import shutil
 import subprocess
+
+from system import privileged
 
 
 SERVICE_NAME_RE = re.compile(r"^[A-Za-z0-9_.@-]+(?:\.service)?$")
@@ -53,10 +54,10 @@ def control_service(name: str, action: str) -> str:
         raise ValueError(f"허용되지 않은 서비스 이름: {name}")
     if not name.endswith('.service'):
         name = f"{name}.service"
-    systemctl_bin = shutil.which("systemctl") or "/usr/bin/systemctl"
+    # root 소유 래퍼(pm-service)가 있으면 래퍼로, 없는 구버전 설치면 기존 sudo systemctl로 제어합니다.
     try:
         subprocess.run(
-            ['sudo', '-n', systemctl_bin, action, name],
+            privileged.service_command(action, name),
             check=True, timeout=15,
             capture_output=True, text=True,
         )
