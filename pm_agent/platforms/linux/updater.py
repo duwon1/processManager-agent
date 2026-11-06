@@ -16,12 +16,13 @@ async def self_update(agent_dir: str, target_sha: str = "") -> tuple[bool, str]:
         return False, "invalid targetSha"
 
     safe_agent_dir = shlex.quote(agent_dir)
+    # 설치 스크립트가 고친 파일 등 로컬 변경은 버려도 되는 내용이라 --force로 덮어씁니다. (.env 같은 추적되지 않는 파일은 남습니다)
     update_commands = [f"git -C {safe_agent_dir} fetch origin master"]
     if normalized_target_sha:
-        update_commands.append(f"git -C {safe_agent_dir} checkout --detach {shlex.quote(normalized_target_sha)}")
+        update_commands.append(f"git -C {safe_agent_dir} checkout --force --detach {shlex.quote(normalized_target_sha)}")
     else:
         update_commands.extend([
-            f"git -C {safe_agent_dir} checkout master",
+            f"git -C {safe_agent_dir} checkout --force master",
             f"git -C {safe_agent_dir} pull --ff-only origin master",
         ])
     dependency_command = (
