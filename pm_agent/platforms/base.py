@@ -26,6 +26,21 @@ class PlatformAdapter(ABC):
     def kill_process(self, pid: int) -> str:
         """PID 기준으로 프로세스를 종료하고 결과 메시지를 반환합니다."""
 
+    def get_process_name(self, pid: int) -> str:
+        """PID의 현재 프로세스 이름을 반환합니다. (Linux/Windows 공통 구현)
+
+        - 프로세스가 없으면 LookupError를 발생시킵니다.
+        - 권한 부족(AccessDenied) 등으로 이름을 읽지 못하면 ""를 반환합니다.
+          protection.execute_kill은 ""를 '알 수 없는 프로세스'로 보고 종료를 거부합니다.
+        """
+        return lookup_process_name(pid)
+
+    def get_process_started_at(self, pid: int) -> str | None:
+        """프로세스 목록의 started_at과 같은 포맷으로 현재 시작 시각을 반환합니다.
+        OS별 adapter가 구현하지 않으면 None을 반환해 startedAt 검증 시 종료를 거부합니다.
+        """
+        return None
+
     @abstractmethod
     def list_services(self) -> list[dict[str, Any]]:
         """서비스 목록을 수집합니다."""
@@ -93,3 +108,15 @@ class PlatformAdapter(ABC):
     @abstractmethod
     def start_self_uninstall(self, agent_dir: str, service_name: str) -> None:
         """자가 삭제 작업을 백그라운드로 시작합니다."""
+
+
+def lookup_process_name(pid: int) -> str:
+    """psutil로 PID의 프로세스 이름을 조회합니다. 모든 OS adapter가 이 한 구현을 공유합니다."""
+    import psutil
+
+    try:
+        return psutil.Process(pid).name() or ""
+    except psutil.NoSuchProcess as exc:
+        raise LookupError(f"프로세스 {pid}를 찾을 수 없습니다.") from exc
+    except (psutil.AccessDenied, OSError):
+        return ""

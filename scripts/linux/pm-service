@@ -1,0 +1,58 @@
+#!/bin/sh
+# Process Manager 에이전트 전용 systemd 서비스 제어 래퍼입니다.
+# install.sh가 /usr/local/lib/processmanager/pm-service (root:root 0755)로 설치하고,
+# sudoers는 `systemctl start *.service` 같은 와일드카드 대신 이 경로만 허용합니다.
+# 인자는 정확히 <start|stop|restart> <서비스명> 두 개만 받고, 보호 대상 서비스는 제어하지 않습니다.
+set -u
+PATH=/usr/sbin:/usr/bin:/sbin:/bin
+LC_ALL=C
+export PATH LC_ALL
+
+fail() {
+    echo "pm-service: $1" >&2
+    exit "${2:-2}"
+}
+
+[ "$#" -eq 2 ] || fail "사용법: pm-service <start|stop|restart> <서비스명>"
+action=$1
+name=$2
+
+case "$action" in
+    start|stop|restart) ;;
+    *) fail "허용되지 않은 액션: $action" ;;
+esac
+
+# 영문/숫자/@._- 만 허용하고, 옵션처럼 보이는 이름(-로 시작)이나 .으로 시작하는 이름은 거부합니다.
+case "$name" in
+    ''|*[!A-Za-z0-9@._-]*) fail "허용되지 않은 서비스 이름: $name" ;;
+    -*|.*) fail "허용되지 않은 서비스 이름: $name" ;;
+esac
+
+# .service가 아닌 unit(target/socket/mount 등)은 제어하지 않습니다.
+case "$name" in
+    *.service) unit=$name ;;
+    *.target|*.socket|*.device|*.mount|*.automount|*.swap|*.timer|*.path|*.slice|*.scope)
+        fail "서비스(.service)가 아닌 unit은 제어할 수 없습니다: $name" ;;
+    *) unit="$name.service" ;;
+esac
+
+base=$(printf '%s' "${unit%.service}" | tr 'A-Z' 'a-z')
+[ -n "$base" ] || fail "허용되지 않은 서비스 이름: $name"
+
+# systemd 핵심 서비스, 그 D-Bus 별칭(dbus-org.*), 인증 없는 root 셸(debug-shell)은 start 포함 모든 액션을 거부합니다.
+case "$base" in
+    systemd-*|dbus-org.*|debug-shell) fail "$unit 서비스는 보호 대상이라 $action하지 않았습니다." ;;
+esac
+
+# 원격 접속/로그인/네트워크/방화벽/감사 로그/메시지 버스/에이전트 자신은 stop/restart를 거부합니다.
+if [ "$action" != "start" ]; then
+    case "$base" in
+        sshd|ssh|sshd@*|ssh@*|dbus|dbus-broker|networkmanager|networking|\
+        firewalld|ufw|nftables|iptables|ip6tables|auditd|\
+        user@*|getty@*|serial-getty@*|\
+        processmanager-agent|processmanager-agent-*)
+            fail "$unit 서비스는 보호 대상이라 $action하지 않았습니다." ;;
+    esac
+fi
+
+exec systemctl "$action" "$unit"

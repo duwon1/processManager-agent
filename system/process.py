@@ -1,5 +1,4 @@
 import os
-import shutil
 import signal
 import subprocess
 import time
@@ -8,6 +7,8 @@ from typing import Dict, List
 
 import psutil
 from fastapi import APIRouter, HTTPException
+
+from system import privileged
 
 router = APIRouter(prefix="/process", tags=["Process"])
 
@@ -161,6 +162,16 @@ def get_process_data() -> List[Dict]:
     )[:PROCESS_LIMIT]
 
 
+def get_process_started_at(pid: int) -> str | None:
+    """프로세스 목록의 started_at과 같은 format_started_at으로 현재 시작 시각을 반환합니다."""
+    try:
+        return format_started_at(psutil.Process(pid).create_time())
+    except psutil.NoSuchProcess as exc:
+        raise LookupError(f"프로세스 {pid}를 찾을 수 없습니다.") from exc
+    except psutil.AccessDenied:
+        return None
+
+
 def kill_process_by_pid(pid: int) -> str:
     try:
         os.kill(pid, signal.SIGKILL)
@@ -168,10 +179,10 @@ def kill_process_by_pid(pid: int) -> str:
     except ProcessLookupError as exc:
         raise HTTPException(status_code=404, detail=f"프로세스 {pid}를 찾을 수 없습니다.") from exc
     except PermissionError as exc:
-        kill_bin = shutil.which("kill") or "/usr/bin/kill"
+        # root 소유 래퍼(pm-kill)가 있으면 래퍼로, 없는 구버전 설치면 기존 sudo kill -9로 종료합니다.
         try:
             result = subprocess.run(
-                ["sudo", "-n", kill_bin, "-9", str(pid)],
+                privileged.kill_command(pid),
                 check=True,
                 timeout=10,
                 capture_output=True,
@@ -195,8 +206,3 @@ def _is_sudo_denied(detail: str) -> bool:
 @router.get("/all", response_model=List[Dict])
 def get_all_processes_http():
     return get_process_data()
-
-
-@router.delete("/{pid}")
-def kill_process(pid: int):
-    return {"message": kill_process_by_pid(pid)}

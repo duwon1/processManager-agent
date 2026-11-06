@@ -11,6 +11,11 @@ def list_processes() -> list[dict[str, Any]]:
     return legacy_process.get_process_data()
 
 
+def get_process_started_at(pid: int) -> str | None:
+    """프로세스 목록과 같은 포맷으로 PID의 현재 started_at을 반환합니다."""
+    return legacy_process.get_process_started_at(pid)
+
+
 def kill_process(pid: int) -> str:
     """PID 기준으로 Linux 프로세스를 종료합니다."""
     return legacy_process.kill_process_by_pid(pid)

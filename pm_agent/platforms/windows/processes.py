@@ -178,6 +178,23 @@ def list_processes() -> list[dict[str, Any]]:
     return _list_processes_psutil()
 
 
+def get_process_started_at(pid: int) -> str | None:
+    """list_processes와 같은 수집 경로/포맷 함수로 PID의 현재 started_at을 반환합니다."""
+    if native_process_snapshot is not None:
+        try:
+            return native_process_snapshot.get_started_at(pid)
+        except LookupError:
+            raise
+        except Exception:
+            pass
+    try:
+        return _format_started_at(psutil.Process(pid).create_time())
+    except psutil.NoSuchProcess as exc:
+        raise LookupError(f"프로세스 {pid}를 찾을 수 없습니다.") from exc
+    except (psutil.AccessDenied, OSError):
+        return None
+
+
 def kill_process(pid: int) -> str:
     if pid <= 0:
         raise RuntimeError("올바르지 않은 PID입니다.")

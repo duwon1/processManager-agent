@@ -1,0 +1,48 @@
+#!/bin/sh
+# Process Manager 에이전트 전용 프로세스 강제 종료 래퍼입니다.
+# install.sh가 /usr/local/lib/processmanager/pm-kill (root:root 0755)로 설치하고,
+# sudoers는 `kill -9 [0-9]*` 같은 와일드카드 대신 이 경로만 허용합니다.
+# 인자는 정확히 PID 하나만 받고, 보호 대상 프로세스는 종료하지 않습니다.
+set -u
+PATH=/usr/sbin:/usr/bin:/sbin:/bin
+LC_ALL=C
+export PATH LC_ALL
+
+fail() {
+    echo "pm-kill: $1" >&2
+    exit "${2:-2}"
+}
+
+[ "$#" -eq 1 ] || fail "사용법: pm-kill <pid> (인자는 PID 하나만 허용합니다)"
+pid=$1
+
+# 숫자만, 앞자리 0 없이, 최대 10자리까지 허용합니다.
+case "$pid" in
+    ''|*[!0-9]*) fail "PID는 숫자만 허용합니다: $pid" ;;
+    0*) fail "올바르지 않은 PID입니다: $pid" ;;
+esac
+[ "${#pid}" -le 10 ] || fail "올바르지 않은 PID입니다: $pid"
+[ "$pid" -gt 1 ] || fail "PID 1(init/systemd)은 보호 대상이라 종료하지 않았습니다."
+
+[ -d "/proc/$pid" ] || fail "프로세스 $pid를 찾을 수 없습니다." 3
+# 스레드 ID(TID)도 /proc에 보이고 kill하면 프로세스 전체가 죽습니다. 프로세스 ID(Tgid)만 허용해 보호 검사를 우회하지 못하게 합니다.
+tgid=$(sed -n 's/^Tgid:[[:space:]]*//p' "/proc/$pid/status" 2>/dev/null)
+[ "$tgid" = "$pid" ] || fail "스레드 ID가 아닌 프로세스 ID만 종료할 수 있습니다: $pid"
+comm=$(cat "/proc/$pid/comm" 2>/dev/null) || fail "프로세스 $pid 이름을 확인할 수 없어 종료하지 않았습니다."
+[ -n "$comm" ] || fail "프로세스 $pid 이름을 확인할 수 없어 종료하지 않았습니다."
+case "$comm" in
+    systemd|init|sshd|sshd-session) fail "$comm 프로세스는 보호 대상이라 종료하지 않았습니다." ;;
+esac
+
+# 에이전트 서비스(processmanager-agent*)의 MainPID는 종료하지 않습니다.
+if command -v systemctl >/dev/null 2>&1; then
+    units=$(systemctl list-units --all --plain --no-legend --type=service 'processmanager-agent*' 2>/dev/null | awk '{print $1}')
+    for unit in $units; do
+        main_pid=$(systemctl show -p MainPID "$unit" 2>/dev/null | sed -n 's/^MainPID=//p')
+        if [ "$main_pid" = "$pid" ]; then
+            fail "에이전트 서비스($unit) 프로세스는 종료할 수 없습니다."
+        fi
+    done
+fi
+
+exec kill -9 "$pid"

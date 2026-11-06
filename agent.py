@@ -11,6 +11,7 @@ import websockets
 from fastapi import HTTPException
 
 from pm_agent.platforms.factory import get_platform_adapter
+from pm_agent.protection import execute_kill, protected_service_reason
 from pm_agent.update_policy import normalize_target_sha
 from stomp import stomp_frame, extract_stomp_body, extract_stomp_destination
 
@@ -552,8 +553,14 @@ async def run_agent(
                             svc_name = payload.get("name", "")
                             action = payload.get("action", "")
                             try:
-                                message = platform_adapter.control_service(svc_name, action)
-                                success = True
+                                # sshd/systemd-*/에이전트 자기 서비스는 stop/restart를 거부합니다.
+                                protected_reason = protected_service_reason(svc_name, action, service_name)
+                                if protected_reason:
+                                    message = protected_reason
+                                    success = False
+                                else:
+                                    message = platform_adapter.control_service(svc_name, action)
+                                    success = True
                             except Exception as e:
                                 message = str(e)
                                 success = False
@@ -574,25 +581,6 @@ async def run_agent(
                                     await send_service_snapshot("service refresh")
                                 except Exception as refresh_error:
                                     print(f"[에이전트] 서비스 제어 후 즉시 갱신 오류: {refresh_error}")
-                            continue
-
-                        # ── 파일 목록 요청 처리 ──
-                        if cmd_type == "file-list":
-                            try:
-                                response = platform_adapter.list_files(str(payload.get("path", "") or ""))
-                            except Exception as e:
-                                response = {
-                                    "path": str(payload.get("path", "") or ""),
-                                    "parent": "",
-                                    "entries": [],
-                                    "error": str(e),
-                                }
-
-                            await websocket.send(stomp_frame(
-                                "SEND",
-                                {"destination": "/app/file-list.result", "content-type": "application/json"},
-                                json.dumps(response),
-                            ))
                             continue
 
                         # ── 업데이트 명령 처리 ──
@@ -645,9 +633,10 @@ async def run_agent(
                         if not request_id or pid <= 0:
                             continue
 
+                        # startedAt이 있으면 같은 PID의 프로세스가 그대로인지 확인한 뒤에만 종료합니다.
+                        started_at = payload.get("startedAt")
                         try:
-                            message = platform_adapter.kill_process(pid)
-                            success = True
+                            success, message = execute_kill(platform_adapter, pid, started_at)
                         except HTTPException as exc:
                             message = exc.detail
                             success = False

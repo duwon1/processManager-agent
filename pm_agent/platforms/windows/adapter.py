@@ -27,6 +27,9 @@ class WindowsAdapter(PlatformAdapter):
     def kill_process(self, pid: int) -> str:
         return processes.kill_process(pid)
 
+    def get_process_started_at(self, pid: int) -> str | None:
+        return processes.get_process_started_at(pid)
+
     def list_services(self) -> list[dict[str, Any]]:
         return services.list_services()
 
