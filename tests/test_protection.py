@@ -1,5 +1,7 @@
 import os
+import subprocess
 import unittest
+from unittest import mock
 
 from pm_agent.protection import (
     PROCESS_CHANGED_MESSAGE,
@@ -17,6 +19,8 @@ class FakeAdapter:
     def __init__(self, processes):
         # pid -> (name, started_at)
         self.processes = processes
+        # pid -> OS별 보호 사유 (다른 에이전트 인스턴스, Windows critical 프로세스 등)
+        self.os_protected = {}
         self.killed = []
 
     def get_process_name(self, pid):
@@ -28,6 +32,9 @@ class FakeAdapter:
         if pid not in self.processes:
             raise LookupError(pid)
         return self.processes[pid][1]
+
+    def protected_process_reason(self, pid):
+        return self.os_protected.get(pid)
 
     def kill_process(self, pid):
         self.killed.append(pid)
@@ -127,6 +134,47 @@ class KillContractTests(unittest.TestCase):
             self.assertFalse(success, pid)
             self.assertTrue(message)
         self.assertEqual(adapter.killed, [])
+
+
+class OsSpecificProtectionTests(unittest.TestCase):
+    def test_refuses_target_reported_protected_by_platform(self):
+        # svchost처럼 이름 목록에 없는 프로세스도 OS별 확인에서 걸리면 종료하지 않습니다.
+        adapter = FakeAdapter({900: ("svchost.exe", None), 901: ("svchost.exe", None)})
+        adapter.os_protected[900] = "Windows critical 프로세스"
+
+        success, message = execute_kill(adapter, 900)
+        self.assertFalse(success)
+        self.assertEqual(message, "Windows critical 프로세스")
+
+        success, _ = execute_kill(adapter, 901)
+        self.assertTrue(success)
+        self.assertEqual(adapter.killed, [901])
+
+    def test_linux_refuses_main_pid_of_another_agent_service(self):
+        from pm_agent.platforms.linux import processes as linux_processes
+
+        output = "MainPID=4321\n\nMainPID=0\n\nMainPID=abc\n"
+        completed = subprocess.CompletedProcess(args=[], returncode=0, stdout=output, stderr="")
+        with mock.patch.object(linux_processes.subprocess, "run", return_value=completed) as run:
+            self.assertEqual(linux_processes.agent_service_main_pids(), {4321})
+            self.assertTrue(linux_processes.protected_process_reason(4321))
+            self.assertIsNone(linux_processes.protected_process_reason(4322))
+        self.assertEqual(run.call_args.args[0], ["systemctl", "show", "-p", "MainPID", "processmanager-agent*"])
+
+    def test_linux_does_not_block_kill_without_systemctl(self):
+        from pm_agent.platforms.linux import processes as linux_processes
+
+        with mock.patch.object(linux_processes.subprocess, "run", side_effect=FileNotFoundError()):
+            self.assertIsNone(linux_processes.protected_process_reason(4321))
+
+    @unittest.skipUnless(os.name == "nt", "Windows 전용 API")
+    def test_windows_reports_own_process_as_not_critical(self):
+        from pm_agent.platforms.windows import processes as windows_processes
+
+        self.assertIs(windows_processes.is_critical_process(os.getpid()), False)
+        self.assertIsNone(windows_processes.protected_process_reason(os.getpid()))
+        # 없는 PID는 핸들을 열 수 없어 '확인 불가'로 보고 막지 않습니다.
+        self.assertIsNone(windows_processes.is_critical_process(0x7FFFFFF0))
 
 
 class UnknownProcessNameTests(unittest.TestCase):
