@@ -74,7 +74,8 @@ class KillUsesWrapperTests(unittest.TestCase):
                 super().__init__(detail)
 
         fake_fastapi = types.SimpleNamespace(APIRouter=Router, HTTPException=HTTPException)
-        fake_psutil = types.SimpleNamespace(cpu_count=lambda: 4)
+        # Process는 system.process의 타입 표기에 쓰여, Python 3.13 이하에서는 import 시점에 필요합니다.
+        fake_psutil = types.SimpleNamespace(cpu_count=lambda: 4, Process=object)
         with mock.patch.dict(sys.modules, {"fastapi": fake_fastapi, "psutil": fake_psutil}):
             sys.modules.pop("system.process", None)
             legacy_process = importlib.import_module("system.process")
