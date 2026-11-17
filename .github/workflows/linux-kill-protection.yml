@@ -2,7 +2,8 @@ name: Linux kill protection
 
 on:
   push:
-    branches: [test/linux-kill-protection]
+    branches: [master]
+  pull_request:
   workflow_dispatch:
 
 permissions:
