@@ -1,0 +1,34 @@
+name: Linux kill protection
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  systemd:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -r requirements.txt
+      - name: Unit tests
+        run: python -m unittest discover -s tests
+      - name: Start a stand-in agent service as the runner user
+        run: |
+          sudo tee /etc/systemd/system/processmanager-agent-citest.service >/dev/null <<UNIT
+          [Service]
+          User=$(id -un)
+          ExecStart=/bin/sleep 600
+          UNIT
+          sudo systemctl daemon-reload
+          sudo systemctl start processmanager-agent-citest.service
+          systemctl show -p MainPID processmanager-agent-citest.service
+      - name: Refuse to kill the agent service MainPID
+        run: PYTHONPATH=. python tests/integration/linux_agent_kill_protection.py
