@@ -41,6 +41,10 @@ class PlatformAdapter(ABC):
         """
         return None
 
+    def protected_process_reason(self, pid: int) -> str | None:
+        """이름 목록만으로 걸러지지 않는 OS별 보호 대상이면 거부 사유를, 아니면 None을 반환합니다."""
+        return None
+
     @abstractmethod
     def list_services(self) -> list[dict[str, Any]]:
         """서비스 목록을 수집합니다."""

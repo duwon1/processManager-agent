@@ -1,6 +1,8 @@
 """Windows process collection and control."""
 from __future__ import annotations
 
+import ctypes
+from ctypes import wintypes
 from datetime import datetime
 import os
 import time
@@ -18,6 +20,7 @@ CPU_COUNT = psutil.cpu_count() or 1
 CPU_SAMPLE_INTERVAL = 0.1
 MAX_CMDLINE_LENGTH = 160
 MAX_EXE_LENGTH = 120
+_PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
 
 _io_cache: dict[int, tuple[float, float, float]] = {}
 _native_fallback_reported = False
@@ -193,6 +196,41 @@ def get_process_started_at(pid: int) -> str | None:
         raise LookupError(f"프로세스 {pid}를 찾을 수 없습니다.") from exc
     except (psutil.AccessDenied, OSError):
         return None
+
+
+def is_critical_process(pid: int) -> bool | None:
+    """Windows가 critical로 표시한 프로세스인지 반환합니다. 확인할 수 없으면 None입니다.
+
+    critical 프로세스는 종료되면 OS가 블루스크린으로 멈춥니다. svchost처럼 같은 이름의 인스턴스 중
+    일부만 critical인 경우가 있어 이름 목록으로는 구분할 수 없으므로 OS에 직접 묻습니다.
+    """
+    try:
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.OpenProcess.restype = wintypes.HANDLE
+        kernel32.OpenProcess.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
+        kernel32.IsProcessCritical.restype = wintypes.BOOL
+        kernel32.IsProcessCritical.argtypes = (wintypes.HANDLE, ctypes.POINTER(wintypes.BOOL))
+        kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+    except (AttributeError, OSError):
+        # IsProcessCritical은 Windows 8.1부터 있습니다. 없으면 이름 목록 보호만 적용됩니다.
+        return None
+    handle = kernel32.OpenProcess(_PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+    if not handle:
+        return None
+    try:
+        critical = wintypes.BOOL()
+        if not kernel32.IsProcessCritical(handle, ctypes.byref(critical)):
+            return None
+        return bool(critical.value)
+    finally:
+        kernel32.CloseHandle(handle)
+
+
+def protected_process_reason(pid: int) -> str | None:
+    # 확인할 수 없는(None) 프로세스는 핸들을 열 권한이 없다는 뜻이라 종료도 실패하므로 여기서 막지 않습니다.
+    if is_critical_process(pid):
+        return "Windows critical 프로세스는 종료하면 시스템이 멈추므로 종료하지 않았습니다."
+    return None
 
 
 def kill_process(pid: int) -> str:

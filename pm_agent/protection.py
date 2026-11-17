@@ -145,6 +145,10 @@ def execute_kill(platform_adapter: Any, pid: int, started_at: str | None = None)
     reason = protected_process_name_reason(process_name)
     if reason:
         return False, reason
+    # 이름으로는 알 수 없는 보호 대상(다른 에이전트 인스턴스, Windows critical 프로세스)을 OS별로 확인합니다.
+    reason = platform_adapter.protected_process_reason(pid)
+    if reason:
+        return False, reason
 
     if expected_started_at:
         # 프로세스 목록에 보고한 started_at과 같은 포맷 함수로 현재 값을 다시 계산해 비교합니다.
