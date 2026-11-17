@@ -33,6 +33,7 @@ Managed PC or Server
 | 실시간 모니터링 | CPU, GPU, 메모리, 디스크, 네트워크 사용률 수집 |
 | 프로세스 관리 | 프로세스 목록 조회, CPU/메모리/I/O 사용량 전송, 프로세스 종료 |
 | 서비스 관리 | 서비스 목록 조회, 실행, 중지, 재시작 |
+| 보호 규칙 | 에이전트 자신, 원격 접속 경로, OS 핵심 프로세스/서비스는 서버 명령이 와도 종료·중지하지 않음 |
 | 웹 터미널 | 브라우저 터미널 입력을 실제 장비의 PowerShell/CMD/Linux shell로 전달 |
 | 하드웨어 정보 | CPU, 메모리, 디스크, GPU, 네트워크 어댑터 등 장비 정보 수집 |
 | 장치 인벤토리 | 장치 관리자 형태의 장치/드라이버 정보 수집 |
@@ -62,11 +63,18 @@ processManager-agent
 ├─ config.py                # .env 로딩과 실행 설정
 ├─ stomp.py                 # STOMP 프레임 생성/파싱
 ├─ terminal.py              # Linux PTY 터미널 구현
-├─ pm_agent/platforms/      # OS별 기능 adapter
-│  ├─ base.py               # 공통 인터페이스
-│  ├─ factory.py            # OS별 adapter 선택
-│  ├─ windows/              # Windows 메트릭, 서비스, 터미널, 업데이트
-│  └─ linux/                # Linux 메트릭, 서비스, 터미널, 업데이트
+├─ pm_agent/
+│  ├─ protection.py         # 프로세스 종료/서비스 제어 보호 규칙
+│  ├─ update_policy.py      # 업데이트 대상 커밋(targetSha) 검증
+│  └─ platforms/            # OS별 기능 adapter
+│     ├─ base.py            # 공통 인터페이스
+│     ├─ factory.py         # OS별 adapter 선택
+│     ├─ windows/           # Windows 메트릭, 서비스, 터미널, 업데이트
+│     └─ linux/             # Linux 메트릭, 서비스, 터미널, 업데이트, sudoers 정리
+├─ system/                  # Linux 수집/제어 구현 (프로세스, 서비스, 권한 상승 명령)
+├─ scripts/linux/           # root 소유로 설치되는 래퍼 (pm-kill, pm-service)
+├─ tests/                   # 단위 테스트, tests/integration은 실제 systemd 확인용
+├─ .github/workflows/       # CI (단위 테스트 + Linux 종료 보호 확인)
 ├─ requirements.txt         # 기본 Python 의존성
 └─ requirements.lock        # 해시 잠금 의존성
 ```
@@ -128,6 +136,30 @@ python main.py
 `ACCOUNT_TOKEN`은 최초 등록에 사용됩니다.
 등록이 완료되면 서버가 `AGENT_SECRET`을 발급하고, 이후 재접속은 `AGENT_SECRET`으로 처리됩니다.
 
+## 보호 규칙
+
+서버에서 온 명령이라도 아래 대상은 종료하거나 중지하지 않습니다. 규칙은 `pm_agent/protection.py`에 있습니다.
+
+| 대상 | 내용 |
+|------|------|
+| 에이전트 자신 | 자기 PID와 부모 PID, 같은 서버의 다른 에이전트 서비스(`processmanager-agent*`)의 MainPID |
+| init / 원격 접속 | PID 1, `systemd`, `init`, `sshd`, `sshd-session` |
+| Windows 핵심 프로세스 | `csrss`, `wininit`, `lsass`, `smss`, `services`, `winlogon`과 Windows가 critical로 표시한 프로세스(`IsProcessCritical`). 일부 `svchost`가 여기에 해당 |
+| 서비스 | `systemd-*`, 에이전트 서비스, `sshd`, 네트워크·방화벽·D-Bus 서비스, Windows의 `TermService`·`WinRM`·`RpcSs`·`EventLog`의 stop/restart. `.service`가 아닌 unit은 모든 동작 거부 |
+| 확인 불가 | 프로세스 이름을 읽을 수 없으면 보호 대상인지 알 수 없으므로 종료하지 않음 |
+
+프로세스 종료 요청에 `startedAt`이 있으면 현재 시작 시각과 비교해, PID가 다른 프로세스로 재사용된 경우 종료하지 않습니다.
+Linux에서는 스레드 ID가 아닌 프로세스 ID만 종료할 수 있습니다.
+
+## Linux 권한
+
+Linux 에이전트는 root가 아닌 설치 사용자로 실행됩니다. 다른 사용자의 프로세스 종료와 서비스 제어처럼 root가 필요한 작업은 sudo로 실행하되, 허용 범위를 좁혀 둡니다.
+
+- sudoers에는 와일드카드 규칙 대신 root 소유 래퍼 두 개만 허용합니다: `pm-kill`(프로세스 종료), `pm-service`(서비스 제어).
+- 래퍼는 에이전트와 같은 보호 규칙을 한 번 더 검사합니다. 에이전트가 침해돼도 sudo로 할 수 있는 일이 래퍼가 허용하는 범위로 제한됩니다.
+- 설치 스크립트(메인 저장소의 `install.sh`)가 래퍼와 sudoers 규칙을 설치합니다. 예전 버전이 남긴 넓은 규칙은 에이전트가 실행되면서 좁은 규칙으로 바꿉니다.
+- 노드를 삭제해도 `/etc/sudoers.d/processmanager*` 파일은 남습니다. 언인스톨러에 이 파일을 지울 권한이 없으므로 직접 삭제해야 합니다.
+
 ## 로컬 확인용 HTTP API
 
 기본 실행에서는 HTTP 서버를 띄우지 않습니다.
@@ -144,11 +176,22 @@ python main.py
 
 에이전트는 주기적으로 원격 Git 커밋을 확인하고, 새 커밋이 있으면 백엔드에 업데이트 가능 상태를 보고합니다.
 서버가 수동 업데이트 명령과 함께 `targetSha`를 전달하면 해당 커밋으로 checkout한 뒤 재시작합니다.
+`targetSha`는 7~40자의 16진수 커밋 해시만 허용합니다.
+업데이트는 설치 디렉터리의 로컬 변경을 덮어씁니다(`git checkout --force`). 설치 디렉터리의 코드를 직접 고쳐 쓰면 업데이트 때 사라집니다.
 
 업데이트 중 `requirements.lock`이 있으면 `pip --require-hashes`로 의존성을 설치합니다.
 이를 통해 업데이트 시점의 Python 패키지 버전과 해시를 고정합니다.
 
 Windows는 예약 작업 기반 재시작 흐름을 사용하고, Linux는 systemd 서비스 기준으로 업데이트/재시작 흐름을 처리합니다.
+
+## 테스트
+
+```bash
+python -m unittest discover -s tests
+```
+
+GitHub Actions(`.github/workflows/linux-kill-protection.yml`)가 PR과 master push마다 Ubuntu에서 단위 테스트를 실행합니다.
+이어서 실제 systemd에 테스트용 에이전트 서비스를 띄우고, 그 MainPID 종료가 거부되는지와 일반 프로세스는 종료되는지 확인합니다(`tests/integration/linux_agent_kill_protection.py`).
 
 ## 관련 저장소
 
